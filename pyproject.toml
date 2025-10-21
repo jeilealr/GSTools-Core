@@ -1,6 +1,6 @@
 [project]
 name = "gstools-core"
-dependencies = ["numpy>=1.20.0,<2"]
+dependencies = ["numpy>=1.20.0"]
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
 dynamic = ["version"]
