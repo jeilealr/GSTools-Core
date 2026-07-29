@@ -24,6 +24,7 @@ pub mod variogram;
 mod gstools_core {
     use crate::field::{summator, summator_fourier, summator_incompr};
     use crate::krige::{calculator_field_krige, calculator_field_krige_and_variance};
+    use crate::mps::{dist_block_categorical, dist_block_l1, dist_block_l2, dist_block_lp};
     use crate::variogram::{
         variogram_directional, variogram_ma_structured, variogram_structured,
         variogram_unstructured,
@@ -211,5 +212,93 @@ mod gstools_core {
         let counts = counts.into_pyarray(py);
 
         (variogram, counts)
+    }
+
+    #[pyfunction(name = "mps_dist_block_cat")]
+    #[allow(clippy::too_many_arguments)]
+    fn mps_dist_block_cat_py<'py>(
+        py: Python<'py>,
+        de_sim: PyReadonlyArray1<f64>,
+        ti_flat: PyReadonlyArray1<f64>,
+        base_flat: PyReadonlyArray1<i64>,
+        lag_flat: PyReadonlyArray1<i64>,
+        node_weights: PyReadonlyArray1<f64>,
+    ) -> Bound<'py, PyArray1<f64>> {
+        dist_block_categorical(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+        )
+        .into_pyarray(py)
+    }
+
+    #[pyfunction(name = "mps_dist_block_l1")]
+    #[allow(clippy::too_many_arguments)]
+    fn mps_dist_block_l1_py<'py>(
+        py: Python<'py>,
+        de_sim: PyReadonlyArray1<f64>,
+        ti_flat: PyReadonlyArray1<f64>,
+        base_flat: PyReadonlyArray1<i64>,
+        lag_flat: PyReadonlyArray1<i64>,
+        node_weights: PyReadonlyArray1<f64>,
+        d_max: f64,
+    ) -> Bound<'py, PyArray1<f64>> {
+        dist_block_l1(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            d_max,
+        )
+        .into_pyarray(py)
+    }
+
+    #[pyfunction(name = "mps_dist_block_l2")]
+    #[allow(clippy::too_many_arguments)]
+    fn mps_dist_block_l2_py<'py>(
+        py: Python<'py>,
+        de_sim: PyReadonlyArray1<f64>,
+        ti_flat: PyReadonlyArray1<f64>,
+        base_flat: PyReadonlyArray1<i64>,
+        lag_flat: PyReadonlyArray1<i64>,
+        node_weights: PyReadonlyArray1<f64>,
+        d_max: f64,
+    ) -> Bound<'py, PyArray1<f64>> {
+        dist_block_l2(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            d_max,
+        )
+        .into_pyarray(py)
+    }
+
+    #[pyfunction(name = "mps_dist_block_lp")]
+    #[allow(clippy::too_many_arguments)]
+    fn mps_dist_block_lp_py<'py>(
+        py: Python<'py>,
+        de_sim: PyReadonlyArray1<f64>,
+        ti_flat: PyReadonlyArray1<f64>,
+        base_flat: PyReadonlyArray1<i64>,
+        lag_flat: PyReadonlyArray1<i64>,
+        node_weights: PyReadonlyArray1<f64>,
+        d_max: f64,
+        p: f64,
+    ) -> Bound<'py, PyArray1<f64>> {
+        dist_block_lp(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            d_max,
+            p,
+        )
+        .into_pyarray(py)
     }
 }
