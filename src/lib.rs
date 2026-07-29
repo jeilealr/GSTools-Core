@@ -16,6 +16,7 @@ use pyo3::prelude::pymodule;
 
 pub mod field;
 pub mod krige;
+pub mod mps;
 mod short_vec;
 pub mod variogram;
 
