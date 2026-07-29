@@ -24,7 +24,10 @@ pub mod variogram;
 mod gstools_core {
     use crate::field::{summator, summator_fourier, summator_incompr};
     use crate::krige::{calculator_field_krige, calculator_field_krige_and_variance};
-    use crate::mps::{dist_block_categorical, dist_block_l1, dist_block_l2, dist_block_lp};
+    use crate::mps::{
+        dist_block_categorical, dist_block_l1, dist_block_l2, dist_block_lp,
+        scan_node_categorical,
+    };
     use crate::variogram::{
         variogram_directional, variogram_ma_structured, variogram_structured,
         variogram_unstructured,
@@ -300,5 +303,35 @@ mod gstools_core {
             p,
         )
         .into_pyarray(py)
+    }
+
+    #[pyfunction(name = "mps_scan_node_cat")]
+    #[allow(clippy::too_many_arguments)]
+    fn mps_scan_node_cat_py<'py>(
+        py: Python<'py>,
+        lo: PyReadonlyArray1<i64>,
+        win_shape: PyReadonlyArray1<i64>,
+        start: usize,
+        max_scan: usize,
+        threshold: f64,
+        de_sim: PyReadonlyArray1<f64>,
+        ti_flat: PyReadonlyArray1<f64>,
+        ti_strides: PyReadonlyArray1<i64>,
+        lag_flat: PyReadonlyArray1<i64>,
+        node_weights: PyReadonlyArray1<f64>,
+    ) -> Option<Bound<'py, PyArray1<i64>>> {
+        scan_node_categorical(
+            lo.as_array(),
+            win_shape.as_array(),
+            start,
+            max_scan,
+            threshold,
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            ti_strides.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+        )
+        .map(|arr| arr.into_pyarray(py))
     }
 }

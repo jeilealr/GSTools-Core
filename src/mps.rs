@@ -173,6 +173,96 @@ pub fn dist_block_lp(
     }))
 }
 
+/// Full DSBC/DS scan for one simulation node — univariate categorical case.
+///
+/// Combines the Python `_scan_window` outer loop with `_dist_block` into a single
+/// Rust function. Iterates over candidate anchors in scan order (random start,
+/// sequential wrap-around) and computes the weighted categorical distance for each.
+/// Returns the TI coordinates of the best match, or `None` if every candidate has
+/// distance `f64::INFINITY` (only reachable on a masked TI — not triggered when
+/// `ti_has_nan = False`, which is required to reach this function).
+///
+/// # Arguments
+///
+/// * `lo` – Lower-left anchor of the TI search window (TI coordinates), shape `(dim,)`.
+/// * `win_shape` – Search window shape, shape `(dim,)`.
+/// * `start` – Flat index into the window to start scanning from.
+///   Computed in Python as `int(u_start_i * win_size)`.
+/// * `max_scan` – Maximum candidates to evaluate.
+/// * `threshold` – DSBC: `<= 0` (accept first exact match `d == 0`);
+///   DS: `> 0` (accept first `d < threshold`).
+/// * `de_sim` – Data-event categorical values at the sim node, shape `(n,)`.
+/// * `ti_flat` – Flattened TI (categories as `f64`), shape `(ti_size,)`.
+/// * `ti_strides` – C-order strides into the TI, shape `(dim,)`.
+/// * `lag_flat` – Flat lag offsets, shape `(n,)`.
+/// * `node_weights` – Precomputed weights, shape `(n,)`.
+///
+/// # Returns
+///
+/// `Some(coords)` where `coords` has shape `(dim,)` with the TI coordinates of the
+/// best-match anchor, or `None` if all candidates have `f64::INFINITY` distance.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_node_categorical(
+    lo: ArrayView1<'_, i64>,
+    win_shape: ArrayView1<'_, i64>,
+    start: usize,
+    max_scan: usize,
+    threshold: f64,
+    de_sim: ArrayView1<'_, f64>,
+    ti_flat: ArrayView1<'_, f64>,
+    ti_strides: ArrayView1<'_, i64>,
+    lag_flat: ArrayView1<'_, i64>,
+    node_weights: ArrayView1<'_, f64>,
+) -> Option<Array1<i64>> {
+    let dim = lo.len();
+    let win_shape_u: Vec<usize> = win_shape.iter().map(|&s| s as usize).collect();
+    let win_size: usize = win_shape_u.iter().product();
+
+    // C-order strides into the window (not the TI)
+    let mut win_strides = vec![1usize; dim];
+    for d in (0..dim - 1).rev() {
+        win_strides[d] = win_strides[d + 1] * win_shape_u[d + 1];
+    }
+
+    let dsbc = threshold <= 0.0;
+    let mut best_d = f64::INFINITY;
+    let mut best_coords: Option<Array1<i64>> = None;
+
+    for k in 0..max_scan {
+        let pos = (start + k) % win_size;
+        // Decode flat window position into dim-D TI coordinates
+        let mut coords = Array1::<i64>::zeros(dim);
+        let mut rem = pos;
+        for d in 0..dim {
+            let c = (rem / win_strides[d]) as i64;
+            coords[d] = lo[d] + c;
+            rem %= win_strides[d];
+        }
+        // Flat base index in TI for this candidate anchor
+        let base: i64 = coords.iter().zip(ti_strides.iter()).map(|(&c, &s)| c * s).sum();
+
+        // Weighted categorical distance for this candidate
+        let d = de_sim
+            .iter()
+            .zip(lag_flat.iter())
+            .zip(node_weights.iter())
+            .fold(0.0_f64, |acc, ((&de_val, &lag), &wt)| {
+                let ti_val = ti_flat[(base + lag) as usize];
+                acc + if (de_val - ti_val).abs() > 0.5 { wt } else { 0.0 }
+            });
+
+        // DSBC: accept exact match immediately; DS: accept first under threshold
+        if (dsbc && d == 0.0) || (!dsbc && d < threshold) {
+            return Some(coords);
+        }
+        if d < best_d {
+            best_d = d;
+            best_coords = Some(coords);
+        }
+    }
+    best_coords
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +432,64 @@ mod tests {
             base_flat.view(), lag_flat.view(), weights.view(), 4.0, 2.0,
         );
         assert_abs_diff_eq!(d_l2[0], d_lp[0], epsilon = 1e-10);
+    }
+
+    #[test]
+    fn scan_node_cat_finds_exact_match() {
+        // TI (1D): [1,2,3,2,1], window lo=[0], shape=[5], de=[2], lag=[0], w=[1.0]
+        // DSBC: first exact match at scan position 1 (ti[1]=2) → return [1]
+        let lo = array![0_i64];
+        let win_shape = array![5_i64];
+        let ti_flat = array![1.0_f64, 2.0_f64, 3.0_f64, 2.0_f64, 1.0_f64];
+        let ti_strides = array![1_i64];
+        let de_sim = array![2.0_f64];
+        let lag_flat = array![0_i64];
+        let weights = array![1.0_f64];
+        let result = scan_node_categorical(
+            lo.view(), win_shape.view(), 0, 5, 0.0,
+            de_sim.view(), ti_flat.view(), ti_strides.view(),
+            lag_flat.view(), weights.view(),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], 1);
+    }
+
+    #[test]
+    fn scan_node_cat_returns_best_when_no_exact() {
+        // TI: [0,0,1], de=[2], DSBC → no exact match → best is any (all d=1.0) → first scanned
+        let lo = array![0_i64];
+        let win_shape = array![3_i64];
+        let ti_flat = array![0.0_f64, 0.0_f64, 1.0_f64];
+        let ti_strides = array![1_i64];
+        let de_sim = array![2.0_f64];
+        let lag_flat = array![0_i64];
+        let weights = array![1.0_f64];
+        let result = scan_node_categorical(
+            lo.view(), win_shape.view(), 0, 3, 0.0,
+            de_sim.view(), ti_flat.view(), ti_strides.view(),
+            lag_flat.view(), weights.view(),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], 0); // first scanned, all equal d=1.0
+    }
+
+    #[test]
+    fn scan_node_cat_ds_mode_early_exit() {
+        // DS mode: threshold=0.6. TI: [0,1,2], de=[1]
+        // candidate 0: ti[0]=0 ≠ 1 → d=1.0 (≥0.6, no exit); candidate 1: ti[1]=1 == 1 → d=0.0 < 0.6 → exit
+        let lo = array![0_i64];
+        let win_shape = array![3_i64];
+        let ti_flat = array![0.0_f64, 1.0_f64, 2.0_f64];
+        let ti_strides = array![1_i64];
+        let de_sim = array![1.0_f64];
+        let lag_flat = array![0_i64];
+        let weights = array![1.0_f64];
+        let result = scan_node_categorical(
+            lo.view(), win_shape.view(), 0, 3, 0.6,
+            de_sim.view(), ti_flat.view(), ti_strides.view(),
+            lag_flat.view(), weights.view(),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], 1);
     }
 }
