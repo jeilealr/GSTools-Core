@@ -21,10 +21,10 @@ use ndarray::{Array1, ArrayView1};
 ///
 /// # Arguments
 ///
-/// * `de_sim` – Data-event values at the current simulation node, shape `(n,)`.
-///   Integer categories stored as `f64` (same representation as the sim grid).
+/// * `de_sim` – Data-event category labels at the current simulation node, shape `(n,)`.
+///   Labels are stored as `f64` (the same representation as the simulation grid).
 /// * `ti_flat` – Flattened C-order TI array, shape `(ti_size,)`.
-///   Integer categories stored as `f64` (pre-cast by `_DirectSamplingEngine`).
+///   Category labels are stored as `f64` (pre-cast by `_DirectSamplingEngine`).
 /// * `base_flat` – Flat base index for each candidate anchor, shape `(B,)`.
 ///   Computed by Python as `(y_blk @ ti_strides).astype(np.int64)`.
 /// * `lag_flat` – Flat lag offsets, shape `(n,)`.
@@ -48,10 +48,9 @@ pub fn dist_block_categorical(
             .zip(node_weights.iter())
             .fold(0.0_f64, |d, ((&de_val, &lag), &wt)| {
                 let ti_val = ti_flat[(base + lag) as usize];
-                // Integer categories are stored as exact f64 values (0.0, 1.0, …).
-                // A gap > 0.5 reliably identifies a categorical mismatch while
-                // being robust to any future float representation of small integers.
-                d + if (de_val - ti_val).abs() > 0.5 { wt } else { 0.0 }
+                // Match NumPy's categorical comparison exactly: any distinct label
+                // is a mismatch, including non-integer labels close together.
+                d + if de_val != ti_val { wt } else { 0.0 }
             })
     }))
 }
@@ -239,7 +238,11 @@ pub fn scan_node_categorical(
             rem %= win_strides[d];
         }
         // Flat base index in TI for this candidate anchor
-        let base: i64 = coords.iter().zip(ti_strides.iter()).map(|(&c, &s)| c * s).sum();
+        let base: i64 = coords
+            .iter()
+            .zip(ti_strides.iter())
+            .map(|(&c, &s)| c * s)
+            .sum();
 
         // Weighted categorical distance for this candidate
         let d = de_sim
@@ -248,7 +251,7 @@ pub fn scan_node_categorical(
             .zip(node_weights.iter())
             .fold(0.0_f64, |acc, ((&de_val, &lag), &wt)| {
                 let ti_val = ti_flat[(base + lag) as usize];
-                acc + if (de_val - ti_val).abs() > 0.5 { wt } else { 0.0 }
+                acc + if de_val != ti_val { wt } else { 0.0 }
             });
 
         // DSBC: accept exact match immediately; DS: accept first under threshold
@@ -278,8 +281,11 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d = dist_block_categorical(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(),
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert_eq!(d.len(), 1);
         assert_abs_diff_eq!(d[0], 0.0, epsilon = 1e-12);
@@ -294,8 +300,11 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d = dist_block_categorical(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(),
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert_abs_diff_eq!(d[0], 1.0, epsilon = 1e-12);
     }
@@ -311,10 +320,31 @@ mod tests {
         let lag_flat = array![0_i64, 1_i64];
         let weights = array![0.5_f64, 0.5_f64];
         let d = dist_block_categorical(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(),
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert_abs_diff_eq!(d[0], 0.5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn categorical_close_distinct_labels_are_mismatch() {
+        // Categorical labels need not be integer-spaced: 0.1 and 0.2 are distinct.
+        let de_sim = array![0.1_f64];
+        let ti_flat = array![0.2_f64];
+        let base_flat = array![0_i64];
+        let lag_flat = array![0_i64];
+        let weights = array![1.0_f64];
+        let d = dist_block_categorical(
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+        );
+        assert_abs_diff_eq!(d[0], 1.0, epsilon = 1e-12);
     }
 
     #[test]
@@ -327,8 +357,11 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d = dist_block_categorical(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(),
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert_abs_diff_eq!(d[0], 0.0, epsilon = 1e-12);
         assert_abs_diff_eq!(d[1], 1.0, epsilon = 1e-12);
@@ -343,8 +376,11 @@ mod tests {
         let lag_flat = array![-1_i64];
         let weights = array![1.0_f64];
         let d = dist_block_categorical(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(),
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert_abs_diff_eq!(d[0], 0.0, epsilon = 1e-12);
     }
@@ -358,8 +394,12 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d = dist_block_l1(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
         );
         assert_abs_diff_eq!(d[0], 0.5, epsilon = 1e-12);
     }
@@ -375,8 +415,12 @@ mod tests {
         let lag_flat = array![0_i64, 1_i64];
         let weights = array![0.5_f64, 0.5_f64];
         let d = dist_block_l1(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
         );
         assert_abs_diff_eq!(d[0], 0.75, epsilon = 1e-12);
         assert_abs_diff_eq!(d[1], 0.75, epsilon = 1e-12);
@@ -391,8 +435,12 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d = dist_block_l2(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
         );
         assert_abs_diff_eq!(d[0], 0.5, epsilon = 1e-12);
     }
@@ -406,12 +454,21 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d_l1 = dist_block_l1(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
         );
         let d_lp = dist_block_lp(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0, 1.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
+            1.0,
         );
         assert_abs_diff_eq!(d_l1[0], d_lp[0], epsilon = 1e-12);
     }
@@ -424,12 +481,21 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let d_l2 = dist_block_l2(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
         );
         let d_lp = dist_block_lp(
-            de_sim.view(), ti_flat.view(),
-            base_flat.view(), lag_flat.view(), weights.view(), 4.0, 2.0,
+            de_sim.view(),
+            ti_flat.view(),
+            base_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            4.0,
+            2.0,
         );
         assert_abs_diff_eq!(d_l2[0], d_lp[0], epsilon = 1e-10);
     }
@@ -446,9 +512,16 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let result = scan_node_categorical(
-            lo.view(), win_shape.view(), 0, 5, 0.0,
-            de_sim.view(), ti_flat.view(), ti_strides.view(),
-            lag_flat.view(), weights.view(),
+            lo.view(),
+            win_shape.view(),
+            0,
+            5,
+            0.0,
+            de_sim.view(),
+            ti_flat.view(),
+            ti_strides.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 1);
@@ -465,9 +538,16 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let result = scan_node_categorical(
-            lo.view(), win_shape.view(), 0, 3, 0.0,
-            de_sim.view(), ti_flat.view(), ti_strides.view(),
-            lag_flat.view(), weights.view(),
+            lo.view(),
+            win_shape.view(),
+            0,
+            3,
+            0.0,
+            de_sim.view(),
+            ti_flat.view(),
+            ti_strides.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 0); // first scanned, all equal d=1.0
@@ -485,9 +565,43 @@ mod tests {
         let lag_flat = array![0_i64];
         let weights = array![1.0_f64];
         let result = scan_node_categorical(
-            lo.view(), win_shape.view(), 0, 3, 0.6,
-            de_sim.view(), ti_flat.view(), ti_strides.view(),
-            lag_flat.view(), weights.view(),
+            lo.view(),
+            win_shape.view(),
+            0,
+            3,
+            0.6,
+            de_sim.view(),
+            ti_flat.view(),
+            ti_strides.view(),
+            lag_flat.view(),
+            weights.view(),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], 1);
+    }
+
+    #[test]
+    fn scan_node_cat_distinguishes_close_labels() {
+        // Candidate 0 (0.2) differs from de=0.1; candidate 1 is the exact match.
+        // The old tolerance-based comparison incorrectly accepted candidate 0.
+        let lo = array![0_i64];
+        let win_shape = array![2_i64];
+        let ti_flat = array![0.2_f64, 0.1_f64];
+        let ti_strides = array![1_i64];
+        let de_sim = array![0.1_f64];
+        let lag_flat = array![0_i64];
+        let weights = array![1.0_f64];
+        let result = scan_node_categorical(
+            lo.view(),
+            win_shape.view(),
+            0,
+            2,
+            0.0,
+            de_sim.view(),
+            ti_flat.view(),
+            ti_strides.view(),
+            lag_flat.view(),
+            weights.view(),
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 1);

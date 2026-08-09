@@ -25,8 +25,7 @@ mod gstools_core {
     use crate::field::{summator, summator_fourier, summator_incompr};
     use crate::krige::{calculator_field_krige, calculator_field_krige_and_variance};
     use crate::mps::{
-        dist_block_categorical, dist_block_l1, dist_block_l2, dist_block_lp,
-        scan_node_categorical,
+        dist_block_categorical, dist_block_l1, dist_block_l2, dist_block_lp, scan_node_categorical,
     };
     use crate::variogram::{
         variogram_directional, variogram_ma_structured, variogram_structured,
