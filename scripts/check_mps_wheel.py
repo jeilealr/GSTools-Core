@@ -10,6 +10,7 @@ import gstools_core
 REQUIRED_EXPORTS = (
     "mps_dist_block_cat",
     "mps_dist_block_cat_masked",
+    "mps_dist_block_cat_rayon",
     "mps_dist_block_l1",
     "mps_dist_block_l1_masked",
     "mps_dist_block_l2",
