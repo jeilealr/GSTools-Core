@@ -29,7 +29,7 @@ mod gstools_core {
         dist_block_categorical, dist_block_categorical_masked, dist_block_categorical_rayon,
         dist_block_l1, dist_block_l1_masked, dist_block_l2, dist_block_l2_masked, dist_block_lp,
         dist_block_lp_masked, dist_block_variation, dist_block_variation_masked, scan_node,
-        scan_node_categorical,
+        scan_node_categorical, validate_block_inputs, validate_scan_geometry, validate_scan_inputs,
     };
     use crate::mps_engine::{cleanup_pass_engine, simulate_engine};
     use crate::variogram::{
@@ -239,21 +239,16 @@ mod gstools_core {
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        // Audit DS05: a negative or out-of-range flattened index would panic on
-        // `ti_flat[(base + lag) as usize]` and abort the release process; raise
-        // a controlled error instead. (The other mps_dist_block_* kernels share
-        // this base+lag indexing and the same guard pattern.)
-        let ti_len = ti_flat.as_array().len() as i64;
-        for &base in base_flat.as_array().iter() {
-            for &lag in lag_flat.as_array().iter() {
-                let index = base.saturating_add(lag);
-                if index < 0 || index >= ti_len {
-                    return Err(PyValueError::new_err(
-                        "mps_dist_block_cat: flattened TI index out of bounds",
-                    ));
-                }
-            }
-        }
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            None,
+        )
+        .map_err(PyValueError::new_err)?;
         Ok(dist_block_categorical(
             de_sim.as_array(),
             ti_flat.as_array(),
@@ -273,15 +268,25 @@ mod gstools_core {
         base_flat: PyReadonlyArray1<i64>,
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_categorical_rayon(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            None,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_categorical_rayon(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
             lag_flat.as_array(),
             node_weights.as_array(),
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_rayon_num_threads")]
@@ -328,15 +333,25 @@ mod gstools_core {
         base_flat: PyReadonlyArray1<i64>,
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_categorical_masked(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            true,
+            None,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_categorical_masked(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
             lag_flat.as_array(),
             node_weights.as_array(),
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_l1")]
@@ -349,8 +364,18 @@ mod gstools_core {
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_l1(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            Some((d_max, 1.0)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_l1(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -358,7 +383,7 @@ mod gstools_core {
             node_weights.as_array(),
             d_max,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_l1_masked")]
@@ -371,8 +396,18 @@ mod gstools_core {
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_l1_masked(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            true,
+            Some((d_max, 1.0)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_l1_masked(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -380,7 +415,7 @@ mod gstools_core {
             node_weights.as_array(),
             d_max,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_l2")]
@@ -393,8 +428,18 @@ mod gstools_core {
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_l2(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            Some((d_max, 1.0)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_l2(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -402,7 +447,7 @@ mod gstools_core {
             node_weights.as_array(),
             d_max,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_l2_masked")]
@@ -415,8 +460,18 @@ mod gstools_core {
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_l2_masked(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            true,
+            Some((d_max, 1.0)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_l2_masked(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -424,7 +479,7 @@ mod gstools_core {
             node_weights.as_array(),
             d_max,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_lp")]
@@ -438,8 +493,18 @@ mod gstools_core {
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
         p: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_lp(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            Some((d_max, p)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_lp(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -448,7 +513,7 @@ mod gstools_core {
             d_max,
             p,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_lp_masked")]
@@ -462,8 +527,18 @@ mod gstools_core {
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
         p: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_lp_masked(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            true,
+            Some((d_max, p)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_lp_masked(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -472,7 +547,7 @@ mod gstools_core {
             d_max,
             p,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_variation")]
@@ -486,8 +561,18 @@ mod gstools_core {
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
         p: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_variation(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            Some((d_max, p)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_variation(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -496,7 +581,7 @@ mod gstools_core {
             d_max,
             p,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_variation_masked")]
@@ -510,8 +595,18 @@ mod gstools_core {
         node_weights: PyReadonlyArray1<f64>,
         d_max: f64,
         p: f64,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_variation_masked(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            base_flat.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            true,
+            Some((d_max, p)),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(dist_block_variation_masked(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
@@ -520,7 +615,7 @@ mod gstools_core {
             d_max,
             p,
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_scan_node_cat")]
@@ -537,8 +632,27 @@ mod gstools_core {
         ti_strides: PyReadonlyArray1<i64>,
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
-    ) -> Option<Bound<'py, PyArray1<i64>>> {
-        scan_node_categorical(
+    ) -> PyResult<Option<Bound<'py, PyArray1<i64>>>> {
+        validate_scan_geometry(
+            lo.as_array(),
+            win_shape.as_array(),
+            ti_strides.as_array(),
+            ti_flat.as_array().len(),
+            lag_flat.as_array(),
+            threshold,
+        )
+        .map_err(PyValueError::new_err)?;
+        validate_block_inputs(
+            de_sim.as_array(),
+            ti_flat.as_array(),
+            ndarray::ArrayView1::from(&[]),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            false,
+            None,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(scan_node_categorical(
             lo.as_array(),
             win_shape.as_array(),
             start,
@@ -550,7 +664,7 @@ mod gstools_core {
             lag_flat.as_array(),
             node_weights.as_array(),
         )
-        .map(|arr| arr.into_pyarray(py))
+        .map(|arr| arr.into_pyarray(py)))
     }
 
     #[pyfunction(name = "mps_scan_node")]
@@ -581,8 +695,30 @@ mod gstools_core {
         penalty_ncat: PyReadonlyArray1<i64>,
         target_ti_rows: PyReadonlyArray1<i64>,
         check_centers: bool,
-    ) -> Option<Bound<'py, PyArray1<i64>>> {
-        scan_node(
+    ) -> PyResult<Option<Bound<'py, PyArray1<i64>>>> {
+        validate_scan_inputs(
+            lo.as_array(),
+            win_shape.as_array(),
+            threshold,
+            ti_flat.as_array(),
+            ti_strides.as_array(),
+            active_ti_rows.as_array(),
+            event_offsets.as_array(),
+            de_sim.as_array(),
+            lag_flat.as_array(),
+            node_weights.as_array(),
+            variable_weights.as_array(),
+            metric_kinds.as_array(),
+            has_nan.as_array(),
+            d_max.as_array(),
+            p_norm.as_array(),
+            penalty_flat.as_array(),
+            penalty_offsets.as_array(),
+            penalty_ncat.as_array(),
+            target_ti_rows.as_array(),
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(scan_node(
             lo.as_array(),
             win_shape.as_array(),
             start,
@@ -608,7 +744,7 @@ mod gstools_core {
             target_ti_rows.as_array(),
             check_centers,
         )
-        .map(|arr| arr.into_pyarray(py))
+        .map(|arr| arr.into_pyarray(py)))
     }
 
     #[pyfunction(name = "mps_simulate")]

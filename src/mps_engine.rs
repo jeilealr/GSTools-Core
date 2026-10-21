@@ -1,7 +1,6 @@
 //! Rust-owned Direct Sampling simulation engine.
 //!
-//! Python intentionally keeps path and random-number generation during the
-//! migration. This module owns the per-node computation and a
+//! Python supplies path and random-number generation. This module owns the per-node computation and a
 //! deterministic level scheduler: neighbour selection, search-window
 //! construction, candidate scanning, retrieval, variation adjustment, and SG
 //! writes. Nodes in one dependency level are independent and may be evaluated
@@ -130,11 +129,12 @@ fn build_neighbor_cache(
             } else {
                 None
             };
-            let mut selected = Vec::with_capacity(n_neighbors[variable] as usize);
+            let mut selected =
+                Vec::with_capacity((n_neighbors[variable] as usize).min(offsets.nrows()));
             for offset in offsets.rows() {
                 let distance_sq: f64 = offset
                     .iter()
-                    .map(|&component| (component * component) as f64)
+                    .map(|&component| (component as f64) * (component as f64))
                     .sum();
                 if radius_sq.is_some_and(|limit| distance_sq > limit) {
                     break;
@@ -175,13 +175,14 @@ fn build_neighbor_cache(
     cache
 }
 
-/// Neighbour cache for a serial post-processing (cleanup) pass.
+/// Neighbour cache for a post-processing (cleanup) pass.
 ///
 /// Unlike [`build_neighbor_cache`], every in-bounds cell within radius is an
 /// eligible neighbour: a cleanup pass runs over an already-complete field, so
 /// the neighbourhood is fully informed (Meerschman et al. 2013, Sect. 4) and
-/// carries no path-order dependency. Each node keeps the nearest
-/// `n_neighbors[variable]` offsets per variable; `level` is unused (serial).
+/// is independent of visit order. Each node keeps the nearest
+/// `n_neighbors[variable]` offsets. A separate position-oriented dependency DAG
+/// preserves Gauss-Seidel read/write order during parallel execution.
 fn build_cleanup_neighbor_cache(
     path: ArrayView2<'_, i64>,
     sim_shape: ArrayView1<'_, i64>,
@@ -201,11 +202,12 @@ fn build_cleanup_neighbor_cache(
             } else {
                 None
             };
-            let mut selected = Vec::with_capacity(n_neighbors[variable] as usize);
+            let mut selected =
+                Vec::with_capacity((n_neighbors[variable] as usize).min(offsets.nrows()));
             for offset in offsets.rows() {
                 let distance_sq: f64 = offset
                     .iter()
-                    .map(|&component| (component * component) as f64)
+                    .map(|&component| (component as f64) * (component as f64))
                     .sum();
                 if radius_sq.is_some_and(|limit| distance_sq > limit) {
                     break;
@@ -607,7 +609,7 @@ fn simulate_node(
                 neighbor
                     .lag
                     .iter()
-                    .map(|&component| (component * component) as f64)
+                    .map(|&component| (component as f64) * (component as f64))
                     .sum::<f64>()
                     .sqrt(),
             );
@@ -830,13 +832,154 @@ fn simulate_node(
     }
 }
 
-/// Per-domain scan views shared by the main and cleanup engines.
-///
-/// Domain 0 is the primary TI; domains `1..=n_zones` are the zone TIs
-/// (concatenated column-wise in `zone_ti`). For each domain this returns the
-/// TI view, its shape, per-variable `d_max`, the jointly-defined-cell list used
-/// by the unconditional fallback, and whether the TI carries any `NaN`.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn checked_shape_size(shape: ArrayView1<'_, i64>) -> Result<usize, String> {
+    if shape.is_empty() || shape.iter().any(|&s| s <= 0) {
+        return Err("MPS dimensions must be nonempty and positive".into());
+    }
+    shape.iter().try_fold(1_usize, |size, &s| {
+        size.checked_mul(s as usize)
+            .filter(|&n| n <= i64::MAX as usize)
+            .ok_or_else(|| "MPS shape product overflow".into())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_engine_configuration(
+    ti_shape: ArrayView1<'_, i64>,
+    sim_shape: ArrayView1<'_, i64>,
+    fields: ArrayView2<'_, f64>,
+    conditioned: ArrayView2<'_, u8>,
+    path: ArrayView2<'_, i64>,
+    offsets: ArrayView2<'_, i64>,
+    matrices: ArrayView3<'_, f64>,
+    neighbors: ArrayView1<'_, i64>,
+    radius: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    metrics: ArrayView1<'_, i64>,
+    ranges: ArrayView1<'_, f64>,
+    exponents: ArrayView1<'_, f64>,
+    penalty: ArrayView1<'_, f64>,
+    penalty_offsets: ArrayView1<'_, i64>,
+    penalty_ncat: ArrayView1<'_, i64>,
+    distance_power: ArrayView1<'_, f64>,
+    cond_weight: ArrayView1<'_, f64>,
+    threshold: f64,
+    scan_fraction: f64,
+    cleanup: bool,
+) -> Result<(), String> {
+    if ti_shape.len() != sim_shape.len() {
+        return Err("MPS TI and simulation dimensionality must agree".into());
+    }
+    if neighbors.iter().any(|&n| n <= 0) {
+        return Err("MPS neighbor counts must be positive".into());
+    }
+    if radius
+        .iter()
+        .any(|r| !r.is_nan() && (!r.is_finite() || *r <= 0.0))
+    {
+        return Err("MPS radii must be positive finite values or NaN (unlimited)".into());
+    }
+    crate::mps::validate_weights(weights)?;
+    crate::mps::validate_metric_descriptors(
+        metrics,
+        ranges,
+        exponents,
+        penalty,
+        penalty_offsets,
+        penalty_ncat,
+    )?;
+    if distance_power
+        .iter()
+        .chain(cond_weight.iter())
+        .any(|&v| !v.is_finite() || v < 0.0)
+        || !threshold.is_finite()
+        || threshold < 0.0
+        || !scan_fraction.is_finite()
+        || scan_fraction <= 0.0
+    {
+        return Err("MPS threshold/weighting parameters and scan fraction are invalid".into());
+    }
+    if fields.iter().any(|v| v.is_infinite()) || (cleanup && fields.iter().any(|v| !v.is_finite()))
+    {
+        return Err("MPS initial fields contain invalid nonfinite values".into());
+    }
+    if conditioned
+        .iter()
+        .zip(fields.iter())
+        .any(|(&hard, &value)| hard > 1 || (hard != 0 && !value.is_finite()))
+    {
+        return Err("MPS hard mask must be boolean and hard values finite".into());
+    }
+    let mut seen = std::collections::HashSet::with_capacity(path.nrows());
+    for row in path.rows() {
+        if !seen.insert(row.to_vec()) {
+            return Err("MPS path must not contain duplicate nodes".into());
+        }
+    }
+    if !cleanup {
+        let strides = c_strides(sim_shape);
+        let scheduled: std::collections::HashSet<usize> = path
+            .rows()
+            .into_iter()
+            .map(|row| flat_index_iter(row.iter().copied(), &strides))
+            .collect();
+        for (variable, row) in fields.rows().into_iter().enumerate() {
+            for (flat, value) in row.iter().enumerate() {
+                if value.is_nan() && !scheduled.contains(&flat) {
+                    return Err(format!("MPS undefined initial value for variable {variable} is absent from the path"));
+                }
+            }
+        }
+    }
+    let max_shape = sim_shape.iter().copied().max().unwrap_or(1) as i128;
+    let mut max_offsets = vec![0_f64; sim_shape.len()];
+    let mut previous_norm = -1_f64;
+    for row in offsets.rows() {
+        let mut norm = 0_f64;
+        if row.iter().all(|&x| x == 0) {
+            return Err("MPS neighbor offsets must be nonzero".into());
+        }
+        for (axis, &x) in row.iter().enumerate() {
+            if (x as i128).abs() + max_shape > i64::MAX as i128 / 4 {
+                return Err("MPS neighbor offset arithmetic overflow".into());
+            }
+            max_offsets[axis] = max_offsets[axis].max((x as f64).abs());
+            norm += (x as f64) * (x as f64);
+        }
+        if norm < previous_norm {
+            return Err("MPS neighbor offsets must be ordered by distance".into());
+        }
+        previous_norm = norm;
+    }
+    if matrices.iter().any(|v| !v.is_finite()) {
+        return Err("MPS lag transforms must be finite".into());
+    }
+    // Bounds keep rounded transformed offsets, their spread and subsequent
+    // signed flattened arithmetic representable, before any worker runs.
+    let stride_sum: f64 = c_strides(ti_shape).iter().map(|&s| s as f64).sum();
+    let stationary_bound: f64 = max_offsets
+        .iter()
+        .zip(c_strides(ti_shape).iter())
+        .map(|(&offset, &stride)| offset * stride as f64)
+        .sum();
+    if stationary_bound > i64::MAX as f64 / 4.0 {
+        return Err("MPS flattened lag arithmetic overflow".into());
+    }
+    for matrix in matrices.outer_iter() {
+        for row in matrix.rows() {
+            let bound: f64 = row
+                .iter()
+                .zip(max_offsets.iter())
+                .map(|(&a, &b)| a.abs() * b)
+                .sum();
+            if !bound.is_finite() || bound * stride_sum > i64::MAX as f64 / 4.0 {
+                return Err("MPS transformed lag arithmetic overflow".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate the *contents* (not just the shapes) that the engines will index
 /// or that must be finite, returning a controlled error instead of letting a
 /// later out-of-bounds index or `0 * inf` abort the release process (audit
@@ -870,12 +1013,18 @@ fn validate_engine_inputs(
     Ok(())
 }
 
+/// Per-domain scan views shared by the main and cleanup engines.
+///
+/// Domain 0 is the primary TI; domains `1..=n_zones` are the zone TIs
+/// (concatenated column-wise in `zone_ti`). For each domain this returns the
+/// TI view, its shape, per-variable `d_max`, the jointly-defined-cell list used
+/// by the unconditional fallback, and whether the TI carries any `NaN`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn build_domains<'a>(
     ti: ArrayView2<'a, f64>,
     ti_shape: ArrayView1<'a, i64>,
     d_max: ArrayView1<'a, f64>,
-    has_nan: ArrayView1<'_, u8>,
+    _has_nan: ArrayView1<'_, u8>,
     zone_ti: ArrayView2<'a, f64>,
     zone_offsets: ArrayView1<'_, i64>,
     zone_shapes: ArrayView2<'a, i64>,
@@ -892,6 +1041,16 @@ fn build_domains<'a>(
     ),
     String,
 > {
+    if zone_offsets.is_empty()
+        || zone_offsets[0] != 0
+        || zone_offsets
+            .iter()
+            .any(|&x| x < 0 || x as usize > zone_ti.ncols())
+        || zone_offsets[zone_offsets.len() - 1] as usize != zone_ti.ncols()
+        || zone_d_max.iter().any(|x| !x.is_finite() || *x <= 0.0)
+    {
+        return Err("invalid MPS zone offsets or ranges".into());
+    }
     let n_zones = zone_offsets.len().saturating_sub(1);
     if zone_shapes.dim() != (n_zones, ti_shape.len())
         || zone_d_max.dim() != (n_zones, variable_count)
@@ -911,7 +1070,7 @@ fn build_domains<'a>(
         // `*_move` consumes a `Copy` of the `'a` view, so the sub-views keep the
         // input data's lifetime rather than borrowing the local binding.
         let shape = zone_shapes.index_axis_move(Axis(0), zone);
-        if hi < lo || hi > zone_ti.ncols() || (hi - lo) != shape.iter().product::<i64>() as usize {
+        if hi < lo || hi > zone_ti.ncols() || (hi - lo) != checked_shape_size(shape)? {
             return Err("inconsistent MPS zone TI offsets/shape".to_owned());
         }
         domain_tis.push(zone_ti.slice_move(s![.., lo..hi]));
@@ -922,10 +1081,10 @@ fn build_domains<'a>(
     let mut domain_ti_has_nan: Vec<bool> = Vec::with_capacity(n_zones + 1);
     // Per-domain, per-variable missingness (audit DS17): the masked/unmasked
     // kernel choice must follow the SELECTED domain's data, not the primary's.
-    // Domain 0 reuses the Python-supplied primary flags; each zone's flags are
-    // recomputed from that zone's own TI columns.
+    // All flags are recomputed from the selected TI, including the primary,
+    // so raw callers cannot accidentally select an unmasked kernel for NaN data.
     let mut domain_has_nan: Vec<Array1<u8>> = Vec::with_capacity(n_zones + 1);
-    for (domain, dti) in domain_tis.iter().enumerate() {
+    for dti in &domain_tis {
         let has_nan_d = dti.iter().any(|value| value.is_nan());
         let finite_d: Vec<usize> = (0..dti.ncols())
             .filter(|&flat| (0..variable_count).all(|v| !dti[(v, flat)].is_nan()))
@@ -935,14 +1094,10 @@ fn build_domains<'a>(
         }
         domain_ti_has_nan.push(has_nan_d);
         domain_finite_all.push(finite_d);
-        if domain == 0 {
-            domain_has_nan.push(has_nan.to_owned());
-        } else {
-            domain_has_nan
-                .push(Array1::from_iter((0..variable_count).map(|v| {
-                    u8::from((0..dti.ncols()).any(|flat| dti[(v, flat)].is_nan()))
-                })));
-        }
+        domain_has_nan
+            .push(Array1::from_iter((0..variable_count).map(|v| {
+                u8::from((0..dti.ncols()).any(|flat| dti[(v, flat)].is_nan()))
+            })));
     }
     Ok((
         domain_tis,
@@ -987,8 +1142,10 @@ fn build_domains<'a>(
 /// * `has_nan` – Per-variable masked-distance flags.
 /// * `d_max` – Continuous normalization ranges.
 /// * `p_norm` – Lp or variation exponent per variable.
-/// * `threshold` – DSBC when nonpositive; strict DS threshold otherwise.
-/// * `scan_fraction` – Fraction of full TI examined per node.
+/// * `threshold` – Best within the capped candidate budget when zero;
+///   strict early acceptance for a positive DS threshold.
+/// * `scan_fraction` – Candidate budget relative to selected TI size, capped
+///   to the valid window; cleanup effort may produce a value above one.
 /// * `distance_power` – Spatial event-weight exponent.
 /// * `cond_weight` – Conditioning-event weight multiplier.
 /// * `partial_boundary` – Select partial instead of strict-first geometry.
@@ -1034,8 +1191,8 @@ pub fn simulate_engine(
     node_domain: ArrayView1<'_, i64>,
 ) -> Result<SimulationOutput, String> {
     let variable_count = ti.nrows();
-    let ti_size = ti_shape.iter().product::<i64>() as usize;
-    let sg_size = sim_shape.iter().product::<i64>() as usize;
+    let ti_size = checked_shape_size(ti_shape)?;
+    let sg_size = checked_shape_size(sim_shape)?;
     if variable_count == 0
         || ti.ncols() != ti_size
         || initial_fields.dim() != (variable_count, sg_size)
@@ -1062,6 +1219,29 @@ pub fn simulate_engine(
         return Err("inconsistent MPS simulation-engine array shapes".to_owned());
     }
     validate_engine_inputs(path, sim_shape, u_start, u_fallback, ti, zone_ti)?;
+    validate_engine_configuration(
+        ti_shape,
+        sim_shape,
+        initial_fields,
+        conditioned,
+        path,
+        offsets,
+        lag_matrices,
+        n_neighbors,
+        max_radius,
+        variable_weights,
+        metric_kinds,
+        d_max,
+        p_norm,
+        penalty_flat,
+        penalty_offsets,
+        penalty_ncat,
+        distance_power,
+        cond_weight,
+        threshold,
+        scan_fraction,
+        false,
+    )?;
 
     // Domain 0 is the primary TI; domains 1.. are the zone TIs. `node_domain`
     // selects a domain per path node. A zero-length `node_domain`/`zone_*`
@@ -1259,8 +1439,8 @@ pub fn cleanup_pass_engine(
     node_domain: ArrayView1<'_, i64>,
 ) -> Result<(Array2<f64>, usize, usize, usize), String> {
     let variable_count = ti.nrows();
-    let ti_size = ti_shape.iter().product::<i64>() as usize;
-    let sg_size = sim_shape.iter().product::<i64>() as usize;
+    let ti_size = checked_shape_size(ti_shape)?;
+    let sg_size = checked_shape_size(sim_shape)?;
     if variable_count == 0
         || ti.ncols() != ti_size
         || fields_in.dim() != (variable_count, sg_size)
@@ -1287,6 +1467,29 @@ pub fn cleanup_pass_engine(
         return Err("inconsistent MPS cleanup-engine array shapes".to_owned());
     }
     validate_engine_inputs(path, sim_shape, u_start, u_fallback, ti, zone_ti)?;
+    validate_engine_configuration(
+        ti_shape,
+        sim_shape,
+        fields_in,
+        conditioned,
+        path,
+        offsets,
+        lag_matrices,
+        n_neighbors,
+        max_radius,
+        variable_weights,
+        metric_kinds,
+        d_max,
+        p_norm,
+        penalty_flat,
+        penalty_offsets,
+        penalty_ncat,
+        distance_power,
+        cond_weight,
+        threshold,
+        scan_fraction,
+        true,
+    )?;
     let n_zones = zone_offsets.len().saturating_sub(1);
     if node_domain.iter().any(|&d| d < 0 || d as usize > n_zones) {
         return Err("inconsistent MPS zone array shapes".to_owned());

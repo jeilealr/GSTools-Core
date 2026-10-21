@@ -32,7 +32,7 @@ REQUIRED_EXPORTS = (
     "mps_api_version",
 )
 
-# Minimum MPS native ABI revision this smoke test targets.
+# Exact MPS interface revision supported by this paired smoke test.
 REQUIRED_API = 7
 
 
@@ -80,9 +80,9 @@ def main() -> None:
         raise RuntimeError(f"installed wheel is missing MPS exports: {missing}")
 
     api = int(gstools_core.mps_api_version())
-    if api < REQUIRED_API:
+    if api != REQUIRED_API:
         raise RuntimeError(
-            f"installed wheel reports MPS ABI {api}, need >= {REQUIRED_API}"
+            f"installed wheel reports MPS ABI {api}, need exactly {REQUIRED_API}"
         )
 
     distance = gstools_core.mps_dist_block_cat(

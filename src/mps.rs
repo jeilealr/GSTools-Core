@@ -1,13 +1,245 @@
 //! MPS (Multiple Point Statistics) kernels for Direct Sampling.
 //!
-//! Fused gather + distance functions that replace the Python `_dist_block`
-//! closure in `gstools/mps/scan.py`. Each kernel reads TI candidates via
-//! flat-index arithmetic and computes weighted distances in one pass,
-//! avoiding the temporary `all_de_ti` allocation of the Python path.
+//! Fused gather and distance functions used by the Rust simulation engine and
+//! retained Python-callable numerical helpers. Kernels read TI candidates via
+//! flat-index arithmetic without allocating a full candidate/event matrix.
+//! Python exports validate buffers before entering these trusted loops.
 
 use ndarray::{s, Array1, ArrayView1, ArrayView2};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use std::collections::HashMap;
+
+/// Validate a flattened candidate block once, before trusted numerical loops.
+/// Signed bases/lags are allowed when their sums are valid. Bounds use i128
+/// extrema, requiring O(B+n) index checks rather than the full candidate/event
+/// product. Value validation also inspects the supplied TI buffer once.
+pub(crate) fn validate_block_inputs(
+    de: ArrayView1<'_, f64>,
+    ti: ArrayView1<'_, f64>,
+    bases: ArrayView1<'_, i64>,
+    lags: ArrayView1<'_, i64>,
+    weights: ArrayView1<'_, f64>,
+    masked: bool,
+    continuous: Option<(f64, f64)>,
+) -> Result<(), String> {
+    if de.len() != lags.len() || de.len() != weights.len() {
+        return Err("MPS block event, lag and weight lengths must agree".into());
+    }
+    if de.iter().any(|v| !v.is_finite())
+        || ti
+            .iter()
+            .any(|v| v.is_infinite() || (!masked && v.is_nan()))
+    {
+        return Err("MPS block values must be finite (masked TI values may be NaN)".into());
+    }
+    validate_weights(weights)?;
+    if let Some((range, exponent)) = continuous {
+        if !range.is_finite() || range <= 0.0 || !exponent.is_finite() || exponent <= 0.0 {
+            return Err("MPS continuous range and exponent must be finite and positive".into());
+        }
+    }
+    if let (Some(min_lag), Some(max_lag)) = (lags.iter().min(), lags.iter().max()) {
+        for &base in bases.iter() {
+            if (base as i128 + *min_lag as i128) < 0
+                || (base as i128 + *max_lag as i128) >= ti.len() as i128
+            {
+                return Err("MPS flattened TI index out of bounds".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_weights(weights: ArrayView1<'_, f64>) -> Result<(), String> {
+    if weights.iter().any(|w| !w.is_finite() || *w < 0.0) || !weights.sum().is_finite() {
+        return Err("MPS weights must be finite, nonnegative, with a finite sum".into());
+    }
+    Ok(())
+}
+
+/// Checked geometry for raw scans. The signature exposes flattened buffers,
+/// not full TI axes; this proves flattened memory safety, not physical geometry.
+pub(crate) fn validate_scan_geometry(
+    lo: ArrayView1<'_, i64>,
+    shape: ArrayView1<'_, i64>,
+    strides: ArrayView1<'_, i64>,
+    ti_size: usize,
+    lags: ArrayView1<'_, i64>,
+    threshold: f64,
+) -> Result<(), String> {
+    if lo.len() != shape.len() || lo.len() != strides.len() {
+        return Err("MPS scan coordinate, window and stride dimensions must agree".into());
+    }
+    if !threshold.is_finite() || threshold < 0.0 {
+        return Err("MPS scan threshold must be finite and nonnegative".into());
+    }
+    let mut size = 1_usize;
+    let mut min_base = 0_i128;
+    let mut max_base = 0_i128;
+    for ((&lower, &extent), &stride) in lo.iter().zip(shape.iter()).zip(strides.iter()) {
+        if extent < 0 || stride <= 0 {
+            return Err("MPS scan sizes must be nonnegative and strides positive".into());
+        }
+        size = size
+            .checked_mul(extent as usize)
+            .filter(|&n| n <= i64::MAX as usize)
+            .ok_or("MPS scan window size overflow")?;
+        let upper = lower
+            .checked_add(extent.saturating_sub(1))
+            .ok_or("MPS scan coordinate overflow")?;
+        let lower_term = lower as i128 * stride as i128;
+        let upper_term = upper as i128 * stride as i128;
+        // The trusted loop multiplies in i64 before adding terms.
+        if lower_term < i64::MIN as i128 || upper_term > i64::MAX as i128 {
+            return Err("MPS scan stride arithmetic overflow".into());
+        }
+        min_base = min_base
+            .checked_add(lower_term)
+            .ok_or("MPS scan index overflow")?;
+        max_base = max_base
+            .checked_add(upper_term)
+            .ok_or("MPS scan index overflow")?;
+    }
+    if lo.is_empty() || size == 0 {
+        return Ok(());
+    }
+    // Nonnegative coordinates prevent overflow in intermediate signed sums.
+    if lo.iter().any(|&x| x < 0) || min_base < 0 || max_base >= ti_size as i128 {
+        return Err("MPS scan candidate center out of bounds".into());
+    }
+    if let (Some(min_lag), Some(max_lag)) = (lags.iter().min(), lags.iter().max()) {
+        if min_base + (*min_lag as i128) < 0 || max_base + (*max_lag as i128) >= ti_size as i128 {
+            return Err("MPS scan event gather index out of bounds".into());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_scan_inputs(
+    lo: ArrayView1<'_, i64>,
+    shape: ArrayView1<'_, i64>,
+    threshold: f64,
+    ti: ArrayView2<'_, f64>,
+    strides: ArrayView1<'_, i64>,
+    rows: ArrayView1<'_, i64>,
+    offsets: ArrayView1<'_, i64>,
+    de: ArrayView1<'_, f64>,
+    lags: ArrayView1<'_, i64>,
+    weights: ArrayView1<'_, f64>,
+    variable_weights: ArrayView1<'_, f64>,
+    metrics: ArrayView1<'_, i64>,
+    has_nan: ArrayView1<'_, u8>,
+    ranges: ArrayView1<'_, f64>,
+    exponents: ArrayView1<'_, f64>,
+    penalty: ArrayView1<'_, f64>,
+    penalty_offsets: ArrayView1<'_, i64>,
+    penalty_ncat: ArrayView1<'_, i64>,
+    targets: ArrayView1<'_, i64>,
+) -> Result<(), String> {
+    validate_scan_geometry(lo, shape, strides, ti.ncols(), lags, threshold)?;
+    let n = rows.len();
+    if offsets.len() != n + 1
+        || [
+            variable_weights.len(),
+            metrics.len(),
+            has_nan.len(),
+            ranges.len(),
+            exponents.len(),
+            penalty_offsets.len(),
+            penalty_ncat.len(),
+        ]
+        .iter()
+        .any(|&len| len != n)
+        || de.len() != lags.len()
+        || de.len() != weights.len()
+    {
+        return Err("MPS scan descriptor/event lengths must agree".into());
+    }
+    if offsets[0] != 0
+        || offsets[n] != de.len() as i64
+        || offsets.iter().any(|&x| x < 0 || x as usize > de.len())
+        || offsets
+            .iter()
+            .zip(offsets.iter().skip(1))
+            .any(|(a, b)| a > b)
+    {
+        return Err("MPS scan event offsets must partition the event arrays".into());
+    }
+    if rows
+        .iter()
+        .chain(targets.iter())
+        .any(|&r| r < 0 || r as usize >= ti.nrows())
+    {
+        return Err("MPS scan TI row out of bounds".into());
+    }
+    if de.iter().any(|x| !x.is_finite()) || ti.iter().any(|x| x.is_infinite()) {
+        return Err("MPS scan event values must be finite; TI may contain NaN".into());
+    }
+    validate_weights(weights)?;
+    validate_weights(variable_weights)?;
+    validate_metric_descriptors(
+        metrics,
+        ranges,
+        exponents,
+        penalty,
+        penalty_offsets,
+        penalty_ncat,
+    )?;
+    for (v, &row) in rows.iter().enumerate() {
+        if has_nan[v] == 0 && ti.row(row as usize).iter().any(|x| x.is_nan()) {
+            return Err("MPS scan missingness flag does not match TI row".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_metric_descriptors(
+    metrics: ArrayView1<'_, i64>,
+    ranges: ArrayView1<'_, f64>,
+    exponents: ArrayView1<'_, f64>,
+    penalty: ArrayView1<'_, f64>,
+    offsets: ArrayView1<'_, i64>,
+    ncat: ArrayView1<'_, i64>,
+) -> Result<(), String> {
+    for v in 0..metrics.len() {
+        if !(0..=3).contains(&metrics[v]) {
+            return Err("MPS metric kind must be 0, 1, 2 or 3".into());
+        }
+        if !ranges[v].is_finite()
+            || ranges[v] <= 0.0
+            || !exponents[v].is_finite()
+            || exponents[v] <= 0.0
+        {
+            return Err("MPS ranges and exponents must be finite and positive".into());
+        }
+        if offsets[v] < 0 || ncat[v] < 0 {
+            return Err("MPS penalty descriptors must be nonnegative".into());
+        }
+        if metrics[v] == 3 {
+            let count = ncat[v] as usize;
+            let end = count
+                .checked_mul(count)
+                .and_then(|x| (offsets[v] as usize).checked_add(x))
+                .ok_or("MPS penalty size overflow")?;
+            if count == 0 || end > penalty.len() {
+                return Err("MPS penalty block is empty or too short".into());
+            }
+            for i in 0..count {
+                for j in 0..count {
+                    let cost = penalty[offsets[v] as usize + i * count + j];
+                    if !cost.is_finite() || !(0.0..=1.0).contains(&cost) || (i == j && cost != 0.0)
+                    {
+                        return Err(
+                            "MPS penalty costs must be finite in [0,1], with zero diagonal".into(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 #[inline]
 fn categorical_candidate_distance(
@@ -69,8 +301,8 @@ fn categorical_masked_candidate_distance(
 /// `dist[b] = Σᵢ node_weights[i] · (de_sim[i] ≠ ti_flat[base_flat[b] + lag_flat[i]])`
 ///
 /// The caller guarantees all `base_flat[b] + lag_flat[i]` indices are in-bounds.
-/// The Python TI search-window construction (`_intersect_search_windows` in
-/// `neighbors.py`) enforces this invariant before calling this function.
+/// Python exports validate this invariant; the production Rust engine
+/// constructs valid TI search windows before calling the trusted kernels.
 ///
 /// # Arguments
 ///
@@ -152,13 +384,12 @@ pub fn dist_block_categorical_rayon(
 /// `dist[b] = Σ(valid mismatch weights) / Σ(valid weights)`
 ///
 /// A candidate with no positive surviving weight returns `+∞`, matching
-/// Python's `vec_categorical_dist(..., has_nan=True)`. Missingness is
-/// intentionally defined by `is_nan`, not `is_finite`: infinities remain
-/// ordinary numeric category labels in event-distance calculations.
+/// the masked distance contract. TI NaN values denote missing support; the
+/// public boundary rejects infinity and nonfinite simulation events.
 ///
-/// The caller guarantees all flat indices are in bounds. Python continues to
-/// validate candidate centers, select the winner, handle fallback, retrieve
-/// the selected value, and write the simulation grid.
+/// The caller guarantees all flat indices are in bounds. The Rust production
+/// engine validates candidate centers, selects the winner, handles fallback,
+/// retrieves the selected value, and writes the simulation grid.
 ///
 /// # Arguments
 ///
@@ -362,8 +593,7 @@ pub fn dist_block_l2(
 /// `dist[b] = √(Σ(valid weight · ((SG − TI) / d_max)²) / Σ(valid weights))`
 ///
 /// A candidate with no positive surviving weight returns `+∞`. Missingness is
-/// deliberately defined by `is_nan`, matching the migration oracle; infinite
-/// values remain numeric inputs and naturally propagate through the distance.
+/// defined by `is_nan`; Python-callable boundaries reject infinite inputs.
 ///
 /// # Arguments
 ///
@@ -537,8 +767,8 @@ pub fn dist_block_lp_masked(
 ///
 /// This kernel is the NaN-free counterpart of `vec_variation_dist` in
 /// `gstools/mps/distance.py`. It returns only the distance vector — the
-/// winning-anchor mean-shift assignment (Mariethoz2010 Eq. 9) stays in Python
-/// (`TrainingImage.adjust_value`), so Rust does not return an adjusted value.
+/// winning-anchor mean shift is applied separately by the Rust production
+/// engine or the retained `TrainingImage.adjust_value` helper.
 ///
 /// # Arguments
 ///
@@ -648,8 +878,8 @@ pub fn dist_block_variation(
 ///
 /// The support means are unweighted; weights apply only to the centered error.
 /// Empty support, zero surviving weight, and non-finite aggregates return
-/// `+∞`, so the candidate cannot be selected. The accepted-value mean shift
-/// remains in Python and is not part of this block kernel.
+/// `+∞`, so the candidate cannot be selected. The production engine applies
+/// the accepted-value mean shift separately; this block kernel returns distances.
 ///
 /// # Arguments
 ///
@@ -753,8 +983,8 @@ pub fn dist_block_variation_masked(
 /// * `win_shape` – Search window shape, shape `(dim,)`.
 /// * `start` – Flat index into the window to start scanning from.
 ///   Computed in Python as `int(u_start_i * win_size)`.
-/// * `max_scan` – Maximum candidates to evaluate.
-/// * `threshold` – DSBC: `<= 0` (accept first exact match `d == 0`);
+/// * `max_scan` – Maximum candidates to evaluate, capped to the window size.
+/// * `threshold` – DSBC: `0` (accept a zero-distance match early);
 ///   DS: `> 0` (accept first `d < threshold`).
 /// * `de_sim` – Data-event categorical values at the sim node, shape `(n,)`.
 /// * `ti_flat` – Flattened TI (categories as `f64`), shape `(ti_size,)`.
@@ -801,8 +1031,8 @@ pub fn scan_node_categorical(
     let mut best_d = f64::INFINITY;
     let mut best_coords: Option<Array1<i64>> = None;
 
-    for k in 0..max_scan {
-        let pos = (start + k) % win_size;
+    for k in 0..max_scan.min(win_size) {
+        let pos = ((start % win_size) + k) % win_size;
         // Decode flat window position into dim-D TI coordinates
         let mut coords = Array1::<i64>::zeros(dim);
         let mut rem = pos;
@@ -1116,9 +1346,10 @@ fn variation_candidate_distance(
 ///
 /// Candidate order, threshold acceptance, first-in-scan-order tie handling,
 /// masked support, multivariate weighting, and target-centre exclusion are
-/// evaluated inside Rust. Python still prepares the event arrays and search
-/// geometry, and still owns fallback draws, value retrieval, variation mean
-/// shifting, and simulation-grid writes.
+/// evaluated inside Rust. This raw helper accepts prepared events. The production
+/// engine also owns event gathering, fallback selection, value retrieval,
+/// variation mean shifting, and simulation-grid writes; Python supplies run
+/// controls, geometry and pre-generated random draws.
 ///
 /// Per-variable events are stored in concatenated one-dimensional arrays.
 /// `event_offsets[v]..event_offsets[v + 1]` selects variable `v` in
@@ -1130,8 +1361,8 @@ fn variation_candidate_distance(
 /// * `lo` – Lower-left TI coordinate of the common search window, shape `(dim,)`.
 /// * `win_shape` – Common search-window shape, shape `(dim,)`.
 /// * `start` – First flat C-order position in the search window.
-/// * `max_scan` – Maximum number of candidates to visit.
-/// * `threshold` – DSBC when `<= 0`; otherwise strict DS acceptance `d < threshold`.
+/// * `max_scan` – Maximum candidates to visit, capped to the window size.
+/// * `threshold` – DSBC when zero; otherwise strict DS acceptance `d < threshold`.
 /// * `ti_flat` – All TI variables as contiguous rows, shape `(n_variables, ti_size)`.
 /// * `ti_strides` – C-order strides of the shared TI shape, shape `(dim,)`.
 /// * `active_ti_rows` – TI row index for every active event variable, shape `(v,)`.
@@ -1215,8 +1446,10 @@ pub fn scan_node(
     let mut best_distance = f64::INFINITY;
     let mut best_coords: Option<Vec<i64>> = None;
 
-    // Random scan: `max_scan` distinct window positions in random order, keyed
-    // on this node's seed (bounded by the scan budget, not the window size).
+    let max_scan = max_scan.min(win_size);
+
+    // Random scan: effective-budget distinct positions, capped to the window,
+    // in a node-local order keyed on this node's seed.
     let random_positions = if random_scan {
         random_scan_positions(win_size, scan_seed, max_scan)
     } else {
@@ -1230,7 +1463,7 @@ pub fn scan_node(
         let position = if random_scan {
             random_positions[scan_index]
         } else {
-            (start + scan_index) % win_size
+            ((start % win_size) + scan_index) % win_size
         };
         let mut coords = vec![0_i64; dim];
         let mut remainder = position;
@@ -1334,6 +1567,108 @@ mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
+
+    #[test]
+    fn sampler_prefixes_cover_permutations_and_cap_budgets() {
+        for size in [1, 2, 3, 4, 7, 8, 10, 31] {
+            for seed in [0, 1, u64::MAX, 0x8000_0000_0000_0000] {
+                let full = random_scan_positions(size, seed, size);
+                let mut sorted = full.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..size).collect::<Vec<_>>());
+                assert_eq!(full, random_scan_positions(size, seed, size + 7));
+                for count in 0..=size {
+                    assert_eq!(full[..count], random_scan_positions(size, seed, count));
+                }
+            }
+        }
+        assert!(random_scan_positions(0, 0, 5).is_empty());
+    }
+
+    #[test]
+    fn sampler_ordered_prefix_frequency_regression() {
+        // Fixed sample and predeclared generous tolerance: every ordered triple
+        // of four distinct positions has probability 1/24. This detects gross
+        // prefix bias, not a proof of PRNG uniformity or stream independence.
+        let mut counts = std::collections::HashMap::new();
+        for seed in 0..24_000 {
+            *counts.entry(random_scan_positions(4, seed, 3)).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 24);
+        assert!(counts.values().all(|&n| (800..=1200).contains(&n)));
+    }
+
+    #[test]
+    fn bounded_integer_rejects_low_product_region() {
+        let bound = (1_u64 << 63) + 1;
+        let threshold = bound.wrapping_neg() % bound;
+        let initial = (0..100)
+            .find(|&seed| {
+                let mut state = seed;
+                ((splitmix64(&mut state) as u128 * bound as u128) as u64) < threshold
+            })
+            .unwrap();
+        let mut expected_state = initial;
+        let mut draws = 0;
+        let expected = loop {
+            let product = splitmix64(&mut expected_state) as u128 * bound as u128;
+            draws += 1;
+            if product as u64 >= threshold {
+                break (product >> 64) as u64;
+            }
+        };
+        assert!(draws > 1);
+        let mut state = initial;
+        assert_eq!(bounded_u64(&mut state, bound), expected);
+        assert_eq!(state, expected_state);
+    }
+
+    #[test]
+    fn bounded_integer_edges_stay_in_range() {
+        for bound in [1, 2, 3, 7, 8, u64::MAX / 2 + 1, u64::MAX] {
+            let mut state = u64::MAX;
+            for _ in 0..1000 {
+                assert!(bounded_u64(&mut state, bound) < bound);
+            }
+        }
+    }
+
+    #[test]
+    fn block_validator_checks_combined_signed_indices_and_lengths() {
+        let event = array![0.];
+        let ti = array![0.];
+        let weight = array![1.];
+        assert!(validate_block_inputs(
+            event.view(),
+            ti.view(),
+            array![-1].view(),
+            array![1].view(),
+            weight.view(),
+            false,
+            None
+        )
+        .is_ok());
+        assert!(validate_block_inputs(
+            event.view(),
+            ti.view(),
+            array![i64::MAX].view(),
+            array![1].view(),
+            weight.view(),
+            false,
+            None
+        )
+        .is_err());
+        assert!(validate_block_inputs(
+            event.view(),
+            ti.view(),
+            array![0].view(),
+            array![].view(),
+            weight.view(),
+            false,
+            None
+        )
+        .is_err());
+    }
 
     #[test]
     fn categorical_exact_match() {
