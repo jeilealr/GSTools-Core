@@ -31,7 +31,7 @@ mod gstools_core {
         dist_block_lp_masked, dist_block_variation, dist_block_variation_masked, scan_node,
         scan_node_categorical,
     };
-    use crate::mps_engine::simulate_engine;
+    use crate::mps_engine::{cleanup_pass_engine, simulate_engine};
     use crate::variogram::{
         variogram_directional, variogram_ma_structured, variogram_structured,
         variogram_unstructured,
@@ -44,6 +44,8 @@ mod gstools_core {
 
     type MpsSimulationPyOutput<'py> =
         (Bound<'py, PyArray2<f64>>, usize, usize, usize, usize, usize);
+
+    type MpsCleanupPyOutput<'py> = (Bound<'py, PyArray2<f64>>, usize, usize, usize);
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -270,6 +272,36 @@ mod gstools_core {
     #[pyfunction(name = "mps_rayon_num_threads")]
     fn mps_rayon_num_threads_py() -> usize {
         rayon::current_num_threads()
+    }
+
+    /// MPS native ABI / capability revision.
+    ///
+    /// Bumped whenever the MPS entry-point signatures (`mps_simulate`,
+    /// `mps_scan_node`, ...) change in a way the Python layer must detect. The
+    /// crate `__version__` alone is insufficient: it can stay the same across
+    /// an ABI change, so the Python `gstools.mps._core` capability gate keys
+    /// off this integer instead.
+    ///
+    /// Revision history:
+    /// * 1 — initial multivariate engine (scalar `distance_power`/`cond_weight`).
+    /// * 2 — `mps_simulate` takes per-variable `distance_power`/`cond_weight`
+    ///   arrays (length == number of TI variables) instead of scalars.
+    /// * 3 — `mps_simulate`/`mps_scan_node` take per-variable categorical
+    ///   penalty matrices (`penalty_flat`/`penalty_offsets`/`penalty_ncat`) and
+    ///   honour `metric_kind == 3` (categorical penalty distance).
+    /// * 4 — `mps_simulate` takes a `random_scan` flag (and `mps_scan_node` a
+    ///   `random_scan`/`scan_seed` pair) selecting random vs sequential TI scan.
+    /// * 5 — `mps_simulate` takes zone training images
+    ///   (`zone_ti`/`zone_offsets`/`zone_shapes`/`zone_d_max`) and a
+    ///   `node_domain` selector, scanning a per-node domain's TI.
+    /// * 6 — adds `mps_cleanup_pass`, one serial Gauss–Seidel post-processing
+    ///   (cleanup) pass that reopens and re-simulates an already-complete field.
+    /// * 7 — `mps_cleanup_pass` takes `num_threads` and runs the pass over a
+    ///   position-oriented dependency DAG (deterministic serial == parallel);
+    ///   it now returns the effective thread count too.
+    #[pyfunction(name = "mps_api_version")]
+    fn mps_api_version_py() -> u32 {
+        7
     }
 
     #[pyfunction(name = "mps_dist_block_cat_masked")]
@@ -527,6 +559,11 @@ mod gstools_core {
         has_nan: PyReadonlyArray1<u8>,
         d_max: PyReadonlyArray1<f64>,
         p_norm: PyReadonlyArray1<f64>,
+        random_scan: bool,
+        scan_seed: u64,
+        penalty_flat: PyReadonlyArray1<f64>,
+        penalty_offsets: PyReadonlyArray1<i64>,
+        penalty_ncat: PyReadonlyArray1<i64>,
         target_ti_rows: PyReadonlyArray1<i64>,
         check_centers: bool,
     ) -> Option<Bound<'py, PyArray1<i64>>> {
@@ -548,6 +585,11 @@ mod gstools_core {
             has_nan.as_array(),
             d_max.as_array(),
             p_norm.as_array(),
+            random_scan,
+            scan_seed,
+            penalty_flat.as_array(),
+            penalty_offsets.as_array(),
+            penalty_ncat.as_array(),
             target_ti_rows.as_array(),
             check_centers,
         )
@@ -575,12 +617,21 @@ mod gstools_core {
         has_nan: PyReadonlyArray1<u8>,
         d_max: PyReadonlyArray1<f64>,
         p_norm: PyReadonlyArray1<f64>,
+        penalty_flat: PyReadonlyArray1<f64>,
+        penalty_offsets: PyReadonlyArray1<i64>,
+        penalty_ncat: PyReadonlyArray1<i64>,
         threshold: f64,
         scan_fraction: f64,
-        distance_power: f64,
-        cond_weight: f64,
+        random_scan: bool,
+        distance_power: PyReadonlyArray1<f64>,
+        cond_weight: PyReadonlyArray1<f64>,
         partial_boundary: bool,
         num_threads: usize,
+        zone_ti: PyReadonlyArray2<f64>,
+        zone_offsets: PyReadonlyArray1<i64>,
+        zone_shapes: PyReadonlyArray2<i64>,
+        zone_d_max: PyReadonlyArray2<f64>,
+        node_domain: PyReadonlyArray1<i64>,
     ) -> PyResult<MpsSimulationPyOutput<'py>> {
         // Own the arrays before detaching so Python code may run concurrently
         // without being able to mutate buffers borrowed by the Rust engine.
@@ -604,6 +655,16 @@ mod gstools_core {
         let has_nan = has_nan.as_array().to_owned();
         let d_max = d_max.as_array().to_owned();
         let p_norm = p_norm.as_array().to_owned();
+        let penalty_flat = penalty_flat.as_array().to_owned();
+        let penalty_offsets = penalty_offsets.as_array().to_owned();
+        let penalty_ncat = penalty_ncat.as_array().to_owned();
+        let distance_power = distance_power.as_array().to_owned();
+        let cond_weight = cond_weight.as_array().to_owned();
+        let zone_ti = zone_ti.as_array().to_owned();
+        let zone_offsets = zone_offsets.as_array().to_owned();
+        let zone_shapes = zone_shapes.as_array().to_owned();
+        let zone_d_max = zone_d_max.as_array().to_owned();
+        let node_domain = node_domain.as_array().to_owned();
 
         let output = py
             .detach(move || {
@@ -625,12 +686,21 @@ mod gstools_core {
                     has_nan.view(),
                     d_max.view(),
                     p_norm.view(),
+                    penalty_flat.view(),
+                    penalty_offsets.view(),
+                    penalty_ncat.view(),
                     threshold,
                     scan_fraction,
-                    distance_power,
-                    cond_weight,
+                    random_scan,
+                    distance_power.view(),
+                    cond_weight.view(),
                     partial_boundary,
                     num_threads,
+                    zone_ti.view(),
+                    zone_offsets.view(),
+                    zone_shapes.view(),
+                    zone_d_max.view(),
+                    node_domain.view(),
                 )
             })
             .map_err(PyValueError::new_err)?;
@@ -641,6 +711,120 @@ mod gstools_core {
             output.max_ready_width,
             output.used_threads,
             output.collapsed_lag_count,
+        ))
+    }
+
+    #[pyfunction(name = "mps_cleanup_pass")]
+    #[allow(clippy::too_many_arguments)]
+    fn mps_cleanup_pass_py<'py>(
+        py: Python<'py>,
+        ti: PyReadonlyArray2<f64>,
+        ti_shape: PyReadonlyArray1<i64>,
+        fields_in: PyReadonlyArray2<f64>,
+        conditioned: PyReadonlyArray2<u8>,
+        sim_shape: PyReadonlyArray1<i64>,
+        path: PyReadonlyArray2<i64>,
+        lag_matrices: PyReadonlyArray3<f64>,
+        u_start: PyReadonlyArray1<f64>,
+        u_fallback: PyReadonlyArray2<f64>,
+        offsets: PyReadonlyArray2<i64>,
+        n_neighbors: PyReadonlyArray1<i64>,
+        max_radius: PyReadonlyArray1<f64>,
+        variable_weights: PyReadonlyArray1<f64>,
+        metric_kinds: PyReadonlyArray1<i64>,
+        has_nan: PyReadonlyArray1<u8>,
+        d_max: PyReadonlyArray1<f64>,
+        p_norm: PyReadonlyArray1<f64>,
+        penalty_flat: PyReadonlyArray1<f64>,
+        penalty_offsets: PyReadonlyArray1<i64>,
+        penalty_ncat: PyReadonlyArray1<i64>,
+        threshold: f64,
+        scan_fraction: f64,
+        random_scan: bool,
+        distance_power: PyReadonlyArray1<f64>,
+        cond_weight: PyReadonlyArray1<f64>,
+        partial_boundary: bool,
+        num_threads: usize,
+        zone_ti: PyReadonlyArray2<f64>,
+        zone_offsets: PyReadonlyArray1<i64>,
+        zone_shapes: PyReadonlyArray2<i64>,
+        zone_d_max: PyReadonlyArray2<f64>,
+        node_domain: PyReadonlyArray1<i64>,
+    ) -> PyResult<MpsCleanupPyOutput<'py>> {
+        // Own every array before detaching (the GIL-safety boundary, mirroring
+        // mps_simulate): Python may run concurrently and must not mutate buffers
+        // borrowed by the Rust pass.
+        let ti = ti.as_array().to_owned();
+        let ti_shape = ti_shape.as_array().to_owned();
+        let fields_in = fields_in.as_array().to_owned();
+        let conditioned = conditioned.as_array().to_owned();
+        let sim_shape = sim_shape.as_array().to_owned();
+        let path = path.as_array().to_owned();
+        let lag_matrices = lag_matrices.as_array().to_owned();
+        let u_start = u_start.as_array().to_owned();
+        let u_fallback = u_fallback.as_array().to_owned();
+        let offsets = offsets.as_array().to_owned();
+        let n_neighbors = n_neighbors.as_array().to_owned();
+        let max_radius = max_radius.as_array().to_owned();
+        let variable_weights = variable_weights.as_array().to_owned();
+        let metric_kinds = metric_kinds.as_array().to_owned();
+        let has_nan = has_nan.as_array().to_owned();
+        let d_max = d_max.as_array().to_owned();
+        let p_norm = p_norm.as_array().to_owned();
+        let penalty_flat = penalty_flat.as_array().to_owned();
+        let penalty_offsets = penalty_offsets.as_array().to_owned();
+        let penalty_ncat = penalty_ncat.as_array().to_owned();
+        let distance_power = distance_power.as_array().to_owned();
+        let cond_weight = cond_weight.as_array().to_owned();
+        let zone_ti = zone_ti.as_array().to_owned();
+        let zone_offsets = zone_offsets.as_array().to_owned();
+        let zone_shapes = zone_shapes.as_array().to_owned();
+        let zone_d_max = zone_d_max.as_array().to_owned();
+        let node_domain = node_domain.as_array().to_owned();
+
+        let (fields, strict_fallback_count, collapsed_lag_count, used_threads) = py
+            .detach(move || {
+                cleanup_pass_engine(
+                    ti.view(),
+                    ti_shape.view(),
+                    fields_in.view(),
+                    conditioned.view(),
+                    sim_shape.view(),
+                    path.view(),
+                    lag_matrices.view(),
+                    u_start.view(),
+                    u_fallback.view(),
+                    offsets.view(),
+                    n_neighbors.view(),
+                    max_radius.view(),
+                    variable_weights.view(),
+                    metric_kinds.view(),
+                    has_nan.view(),
+                    d_max.view(),
+                    p_norm.view(),
+                    penalty_flat.view(),
+                    penalty_offsets.view(),
+                    penalty_ncat.view(),
+                    threshold,
+                    scan_fraction,
+                    random_scan,
+                    distance_power.view(),
+                    cond_weight.view(),
+                    partial_boundary,
+                    num_threads,
+                    zone_ti.view(),
+                    zone_offsets.view(),
+                    zone_shapes.view(),
+                    zone_d_max.view(),
+                    node_domain.view(),
+                )
+            })
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            fields.into_pyarray(py),
+            strict_fallback_count,
+            collapsed_lag_count,
+            used_threads,
         ))
     }
 }

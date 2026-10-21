@@ -834,6 +834,101 @@ pub fn scan_node_categorical(
 const METRIC_CATEGORICAL: i64 = 0;
 const METRIC_LP: i64 = 1;
 const METRIC_VARIATION: i64 = 2;
+const METRIC_CATEGORICAL_PENALTY: i64 = 3;
+
+/// `count` DISTINCT window positions in `[0, win_size)`, in a node-local random
+/// order keyed on `scan_seed`.
+///
+/// Uses a full-period LCG over the next-power-of-two modulus `m >= win_size`
+/// (Knuth MMIX multiplier, `a ≡ 1 mod 4`; odd increment -> Hull–Dobell full
+/// period). Out-of-range draws are skipped; over one period all `win_size`
+/// in-range values appear exactly once, so `count <= win_size` yields distinct
+/// positions. Memory is `O(count)` (the scan budget) — never a permutation of
+/// the whole window. Determinism is independent of thread scheduling.
+fn random_scan_positions(win_size: usize, scan_seed: u64, count: usize) -> Vec<usize> {
+    const LCG_A: u64 = 6364136223846793005;
+    let mask = (win_size as u64).next_power_of_two() - 1;
+    let increment = scan_seed | 1;
+    let mut state = scan_seed & mask;
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        state = LCG_A.wrapping_mul(state).wrapping_add(increment) & mask;
+        if (state as usize) < win_size {
+            out.push(state as usize);
+        }
+    }
+    out
+}
+
+/// Penalty cost `T[sim_code, ti_code]` for one flattened `ncat x ncat` matrix.
+///
+/// Codes are read from `f64` event/TI values and are validated on the Python
+/// side (`_check_category_codes`); an out-of-range code here is treated as a
+/// full mismatch (cost `1.0`) instead of panicking (release profile aborts on
+/// panic).
+#[inline]
+fn penalty_cost(penalty: &[f64], offset: usize, ncat: usize, sim_val: f64, ti_val: f64) -> f64 {
+    let sim_code = sim_val as usize;
+    let ti_code = ti_val as usize;
+    if sim_val < 0.0 || ti_val < 0.0 || sim_code >= ncat || ti_code >= ncat {
+        return 1.0;
+    }
+    penalty[offset + sim_code * ncat + ti_code]
+}
+
+/// Weighted categorical **penalty** distance for one candidate.
+///
+/// Like [`categorical_candidate_distance`] but replaces the 0/1 mismatch with
+/// the asymmetric cost `T[sim_code, ti_code]` (zero diagonal, off-diagonal in
+/// `(0, 1]`). `penalty` is the variable's flattened `ncat x ncat` matrix.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn categorical_penalty_candidate_distance(
+    base: i64,
+    de_sim: ArrayView1<'_, f64>,
+    ti_flat: ArrayView1<'_, f64>,
+    lag_flat: ArrayView1<'_, i64>,
+    node_weights: ArrayView1<'_, f64>,
+    penalty: &[f64],
+    offset: usize,
+    ncat: usize,
+    masked: bool,
+) -> f64 {
+    if masked {
+        let (cost, weight_sum) = de_sim
+            .iter()
+            .zip(lag_flat.iter())
+            .zip(node_weights.iter())
+            .fold(
+                (0.0_f64, 0.0_f64),
+                |(cost, weight_sum), ((&de_val, &lag), &weight)| {
+                    let ti_val = ti_flat[(base + lag) as usize];
+                    if ti_val.is_nan() {
+                        (cost, weight_sum)
+                    } else {
+                        (
+                            cost + weight * penalty_cost(penalty, offset, ncat, de_val, ti_val),
+                            weight_sum + weight,
+                        )
+                    }
+                },
+            );
+        if weight_sum > 0.0 {
+            cost / weight_sum
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        de_sim
+            .iter()
+            .zip(lag_flat.iter())
+            .zip(node_weights.iter())
+            .fold(0.0_f64, |distance, ((&de_val, &lag), &weight)| {
+                let ti_val = ti_flat[(base + lag) as usize];
+                distance + weight * penalty_cost(penalty, offset, ncat, de_val, ti_val)
+            })
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn continuous_candidate_distance(
@@ -1029,6 +1124,11 @@ pub fn scan_node(
     has_nan: ArrayView1<'_, u8>,
     d_max: ArrayView1<'_, f64>,
     p_norm: ArrayView1<'_, f64>,
+    random_scan: bool,
+    scan_seed: u64,
+    penalty_flat: ArrayView1<'_, f64>,
+    penalty_offsets: ArrayView1<'_, i64>,
+    penalty_ncat: ArrayView1<'_, i64>,
     target_ti_rows: ArrayView1<'_, i64>,
     check_centers: bool,
 ) -> Option<Array1<i64>> {
@@ -1042,11 +1142,27 @@ pub fn scan_node(
 
     let dsbc = threshold <= 0.0;
     let active_weight_total: f64 = variable_weights.sum();
+    let penalty_all = penalty_flat.as_slice().expect("penalty_flat is contiguous");
     let mut best_distance = f64::INFINITY;
     let mut best_coords: Option<Vec<i64>> = None;
 
+    // Random scan: `max_scan` distinct window positions in random order, keyed
+    // on this node's seed (bounded by the scan budget, not the window size).
+    let random_positions = if random_scan {
+        random_scan_positions(win_size, scan_seed, max_scan)
+    } else {
+        Vec::new()
+    };
+
+    // scan_index indexes random_positions in random mode and drives the
+    // wrap-around walk in sequential mode, so the range loop is intentional.
+    #[allow(clippy::needless_range_loop)]
     for scan_index in 0..max_scan {
-        let position = (start + scan_index) % win_size;
+        let position = if random_scan {
+            random_positions[scan_index]
+        } else {
+            (start + scan_index) % win_size
+        };
         let mut coords = vec![0_i64; dim];
         let mut remainder = position;
         for axis in 0..dim {
@@ -1087,6 +1203,17 @@ pub fn scan_node(
                         categorical_candidate_distance(base, de_var, ti_var, lag_var, weight_var)
                     }
                 }
+                METRIC_CATEGORICAL_PENALTY => categorical_penalty_candidate_distance(
+                    base,
+                    de_var,
+                    ti_var,
+                    lag_var,
+                    weight_var,
+                    penalty_all,
+                    penalty_offsets[variable] as usize,
+                    penalty_ncat[variable] as usize,
+                    masked,
+                ),
                 METRIC_LP => continuous_candidate_distance(
                     base,
                     de_var,
@@ -1417,6 +1544,95 @@ mod tests {
             weights.view(),
         );
         assert_abs_diff_eq!(masked[0], plain[0], epsilon = 1e-12);
+    }
+
+    #[test]
+    fn random_scan_positions_are_distinct_and_in_range() {
+        use std::collections::HashSet;
+        // Full window: a permutation of [0, win_size).
+        let full = random_scan_positions(10, 12345, 10);
+        assert_eq!(full.len(), 10);
+        assert_eq!(full.iter().copied().collect::<HashSet<_>>().len(), 10);
+        assert!(full.iter().all(|&p| p < 10));
+        // Non-power-of-two window, partial budget: still distinct + in range.
+        let partial = random_scan_positions(7, 999, 5);
+        assert_eq!(partial.len(), 5);
+        assert_eq!(partial.iter().copied().collect::<HashSet<_>>().len(), 5);
+        assert!(partial.iter().all(|&p| p < 7));
+        // Deterministic for a fixed seed; different seeds generally differ.
+        assert_eq!(
+            random_scan_positions(64, 42, 8),
+            random_scan_positions(64, 42, 8)
+        );
+        assert_ne!(
+            random_scan_positions(64, 42, 8),
+            random_scan_positions(64, 43, 8)
+        );
+    }
+
+    #[test]
+    fn penalty_cost_uses_asymmetric_matrix_orientation() {
+        // T[sim, ti]; asymmetric so orientation is observable.
+        let penalty = [0.0, 0.5, 0.3, 0.0];
+        // sim=1, ti=0 -> row 1, col 0 -> 0.3 (not 0.5).
+        assert_abs_diff_eq!(penalty_cost(&penalty, 0, 2, 1.0, 0.0), 0.3);
+        assert_abs_diff_eq!(penalty_cost(&penalty, 0, 2, 0.0, 1.0), 0.5);
+        // diagonal / exact match is free.
+        assert_abs_diff_eq!(penalty_cost(&penalty, 0, 2, 1.0, 1.0), 0.0);
+        // out-of-range codes fall back to full mismatch 1.0 (no panic).
+        assert_abs_diff_eq!(penalty_cost(&penalty, 0, 2, 5.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn categorical_penalty_candidate_distance_hand_computed() {
+        // de_sim=[0,1], matched TI values both 0 (ti_flat[base+lag]).
+        let de_sim = array![0.0_f64, 1.0_f64];
+        let ti_flat = array![0.0_f64, 0.0_f64];
+        let lag_flat = array![0_i64, 1_i64];
+        let weights = array![0.5_f64, 0.5_f64];
+        let penalty = [0.0, 0.5, 0.3, 0.0]; // T[sim, ti], ncat=2
+                                            // node0: 0.5 * T[0,0]=0 ; node1: 0.5 * T[1,0]=0.5*0.3=0.15 -> 0.15
+        let d = categorical_penalty_candidate_distance(
+            0,
+            de_sim.view(),
+            ti_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            &penalty,
+            0,
+            2,
+            false,
+        );
+        assert_abs_diff_eq!(d, 0.15, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn categorical_penalty_all_ones_matches_plain_mismatch() {
+        // T with off-diagonal 1.0 reproduces the plain 0/1 categorical distance.
+        let de_sim = array![0.0_f64, 1.0_f64, 1.0_f64];
+        let ti_flat = array![0.0_f64, 0.0_f64, 1.0_f64];
+        let lag_flat = array![0_i64, 1_i64, 2_i64];
+        let weights = array![0.25_f64, 0.25_f64, 0.5_f64];
+        let penalty = [0.0, 1.0, 1.0, 0.0];
+        let pen = categorical_penalty_candidate_distance(
+            0,
+            de_sim.view(),
+            ti_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+            &penalty,
+            0,
+            2,
+            false,
+        );
+        let plain = categorical_candidate_distance(
+            0,
+            de_sim.view(),
+            ti_flat.view(),
+            lag_flat.view(),
+            weights.view(),
+        );
+        assert_abs_diff_eq!(pen, plain, epsilon = 1e-12);
     }
 
     #[test]
@@ -2126,6 +2342,11 @@ mod tests {
             has_nan.view(),
             d_max.view(),
             p_norm.view(),
+            false,
+            0,
+            Array1::<f64>::zeros(0).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
             target_rows.view(),
             false,
         )
@@ -2169,6 +2390,11 @@ mod tests {
             has_nan.view(),
             d_max.view(),
             p_norm.view(),
+            false,
+            0,
+            Array1::<f64>::zeros(0).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
             target_rows.view(),
             false,
         )
@@ -2212,6 +2438,11 @@ mod tests {
             has_nan.view(),
             d_max.view(),
             p_norm.view(),
+            false,
+            0,
+            Array1::<f64>::zeros(0).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
             target_rows.view(),
             false,
         )
@@ -2255,6 +2486,11 @@ mod tests {
             has_nan.view(),
             d_max.view(),
             p_norm.view(),
+            false,
+            0,
+            Array1::<f64>::zeros(0).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
             target_rows.view(),
             true,
         )
@@ -2280,6 +2516,11 @@ mod tests {
             has_nan.view(),
             d_max.view(),
             p_norm.view(),
+            false,
+            0,
+            Array1::<f64>::zeros(0).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
             target_rows.view(),
             true,
         );
@@ -2328,6 +2569,11 @@ mod tests {
                 has_nan.view(),
                 d_max.view(),
                 p_norm.view(),
+                false,
+                0,
+                Array1::<f64>::zeros(0).view(),
+                Array1::<i64>::zeros(metric_kinds.len()).view(),
+                Array1::<i64>::zeros(metric_kinds.len()).view(),
                 target_rows.view(),
                 false,
             )
@@ -2372,6 +2618,11 @@ mod tests {
             has_nan.view(),
             d_max.view(),
             p_norm.view(),
+            false,
+            0,
+            Array1::<f64>::zeros(0).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
+            Array1::<i64>::zeros(metric_kinds.len()).view(),
             target_rows.view(),
             false,
         )

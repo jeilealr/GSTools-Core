@@ -9,7 +9,7 @@
 //! order after the level completes.
 
 use crate::mps::scan_node;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -173,6 +173,135 @@ fn build_neighbor_cache(
         cache.push(CachedNode { by_variable, level });
     }
     cache
+}
+
+/// Neighbour cache for a serial post-processing (cleanup) pass.
+///
+/// Unlike [`build_neighbor_cache`], every in-bounds cell within radius is an
+/// eligible neighbour: a cleanup pass runs over an already-complete field, so
+/// the neighbourhood is fully informed (Meerschman et al. 2013, Sect. 4) and
+/// carries no path-order dependency. Each node keeps the nearest
+/// `n_neighbors[variable]` offsets per variable; `level` is unused (serial).
+fn build_cleanup_neighbor_cache(
+    path: ArrayView2<'_, i64>,
+    sim_shape: ArrayView1<'_, i64>,
+    offsets: ArrayView2<'_, i64>,
+    n_neighbors: ArrayView1<'_, i64>,
+    max_radius: ArrayView1<'_, f64>,
+    variable_count: usize,
+) -> Vec<CachedNode> {
+    let strides = c_strides(sim_shape);
+    let mut cache = Vec::with_capacity(path.nrows());
+    for node in 0..path.nrows() {
+        let coords = path.row(node);
+        let mut by_variable = Vec::with_capacity(variable_count);
+        for variable in 0..variable_count {
+            let radius_sq = if max_radius[variable].is_finite() {
+                Some(max_radius[variable] * max_radius[variable])
+            } else {
+                None
+            };
+            let mut selected = Vec::with_capacity(n_neighbors[variable] as usize);
+            for offset in offsets.rows() {
+                let distance_sq: f64 = offset
+                    .iter()
+                    .map(|&component| (component * component) as f64)
+                    .sum();
+                if radius_sq.is_some_and(|limit| distance_sq > limit) {
+                    break;
+                }
+                let mut candidate = Vec::with_capacity(sim_shape.len());
+                let mut in_bounds = true;
+                for axis in 0..sim_shape.len() {
+                    let coordinate = coords[axis] + offset[axis];
+                    if coordinate < 0 || coordinate >= sim_shape[axis] {
+                        in_bounds = false;
+                        break;
+                    }
+                    candidate.push(coordinate);
+                }
+                if !in_bounds {
+                    continue;
+                }
+                selected.push(Neighbor {
+                    flat: flat_index(&candidate, &strides),
+                    lag: offset.to_vec(),
+                });
+                if selected.len() == n_neighbors[variable] as usize {
+                    break;
+                }
+            }
+            by_variable.push(selected);
+        }
+        cache.push(CachedNode {
+            by_variable,
+            level: 0,
+        });
+    }
+    cache
+}
+
+/// Deterministic dependency levels for a parallel cleanup pass.
+///
+/// Edges are oriented by *visit position*: for every eligible-node neighbour
+/// pair the lower position precedes the higher, so the visit order is itself a
+/// topological order (Meerschman et al. 2013, Sect. 4, realised as a DAG). An
+/// earlier-position neighbour is a read-after-write true dependency (the node
+/// reads its refreshed value); a later-position neighbour is a write-after-read
+/// anti-dependency (the node reads its stale value, so it must run before that
+/// neighbour overwrites). Because `n_neighbors` truncation makes the read
+/// relation asymmetric, a pair may be found from either endpoint — taking the
+/// union (any sighting creates the edge) yields the same levels regardless.
+///
+/// `level[node]` is one past the deepest lower-position neighbour. Nodes in one
+/// level are mutually non-adjacent (an edge forces distinct levels), so a
+/// read-the-snapshot/commit-after-level scheduler reproduces serial
+/// Gauss-Seidel at any thread count. Returns the per-level node groups, the
+/// level count, and the widest level.
+fn build_cleanup_levels(
+    cache: &[CachedNode],
+    path: ArrayView2<'_, i64>,
+    sim_shape: ArrayView1<'_, i64>,
+) -> (Vec<Vec<usize>>, usize, usize) {
+    let n = path.nrows();
+    let strides = c_strides(sim_shape);
+    let sg_size = sim_shape.iter().product::<i64>() as usize;
+    // Visit position of each eligible node by flat cell (-1 = frozen / absent).
+    let mut pos_map = vec![-1_i64; sg_size];
+    for (i, coords) in path.rows().into_iter().enumerate() {
+        pos_map[flat_index_iter(coords.iter().copied(), &strides)] = i as i64;
+    }
+    // Lower-position neighbours per node (duplicates are harmless for the max).
+    let mut lower_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, cached) in cache.iter().enumerate() {
+        for by_var in &cached.by_variable {
+            for neighbor in by_var {
+                let other = pos_map[neighbor.flat];
+                if other < 0 || other as usize == i {
+                    continue;
+                }
+                let other = other as usize;
+                let (lo, hi) = if other < i { (other, i) } else { (i, other) };
+                lower_adj[hi].push(lo);
+            }
+        }
+    }
+    let mut node_level = vec![0_usize; n];
+    for hi in 0..n {
+        let level = lower_adj[hi]
+            .iter()
+            .map(|&lo| node_level[lo] + 1)
+            .max()
+            .unwrap_or(0);
+        node_level[hi] = level;
+    }
+    let level_count = node_level.iter().copied().max().map_or(0, |l| l + 1);
+    let mut levels = vec![Vec::new(); level_count];
+    for (node, &level) in node_level.iter().enumerate() {
+        levels[level].push(node);
+    }
+    let max_width = levels.iter().map(Vec::len).max().unwrap_or(0);
+    (levels, level_count, max_width)
 }
 
 fn compute_node_weights(
@@ -417,26 +546,40 @@ fn simulate_node(
     has_nan: ArrayView1<'_, u8>,
     d_max: ArrayView1<'_, f64>,
     p_norm: ArrayView1<'_, f64>,
+    penalty_flat: ArrayView1<'_, f64>,
+    penalty_offsets: ArrayView1<'_, i64>,
+    penalty_ncat: ArrayView1<'_, i64>,
     threshold: f64,
     scan_fraction: f64,
-    distance_power: f64,
-    cond_weight: f64,
+    random_scan: bool,
+    distance_power: ArrayView1<'_, f64>,
+    cond_weight: ArrayView1<'_, f64>,
     partial_boundary: bool,
     finite_all: &[usize],
     ti_has_nan: bool,
+    cleanup: bool,
 ) -> NodeResult {
     let ti_strides = c_strides(ti_shape);
     let sim_strides = c_strides(sim_shape);
     let node_coords = path.row(node);
     let node_flat = flat_index_iter(node_coords.iter().copied(), &sim_strides);
-    let targets: Vec<usize> = (0..fields.nrows())
-        .filter(|&variable| fields[(variable, node_flat)].is_nan())
-        .collect();
+    // Cleanup reopens an already-complete field: a non-conditioned variable is
+    // always a target (its stale value is suppressed, never a self-constraint),
+    // and only a hard-conditioned variable stays as a collocated h=0 row. The
+    // main pass instead keys both off the uninformed (NaN) state.
+    let is_target = |variable: usize| {
+        if cleanup {
+            conditioned[(variable, node_flat)] == 0
+        } else {
+            fields[(variable, node_flat)].is_nan()
+        }
+    };
+    let targets: Vec<usize> = (0..fields.nrows()).filter(|&v| is_target(v)).collect();
 
     let mut events = Vec::with_capacity(fields.nrows());
     let mut collapsed_lag_count = 0_usize;
     for variable in 0..fields.nrows() {
-        let collocated = !fields[(variable, node_flat)].is_nan();
+        let collocated = !is_target(variable);
         let capacity = cached.by_variable[variable].len() + usize::from(collocated);
         let mut event = Event {
             values: Vec::with_capacity(capacity),
@@ -561,8 +704,8 @@ fn simulate_node(
         node_weights.extend(compute_node_weights(
             &event.lag_norms,
             &event.conditioned,
-            distance_power,
-            cond_weight,
+            distance_power[variable],
+            cond_weight[variable],
         ));
         event_offsets.push(de_sim.len() as i64);
     }
@@ -576,6 +719,8 @@ fn simulate_node(
     let ti_size = ti_shape.iter().product::<i64>() as usize;
     let max_scan = 1_usize.max(win_size.min((scan_fraction * ti_size as f64) as usize));
     let start = (u_start[node] * win_size as f64) as usize;
+    // Node-local random-scan seed (reference derives the same from u_start_i).
+    let scan_seed = (u_start[node] * 9007199254740992.0) as u64; // 2^53
 
     let active_rows = Array1::from_iter(active.iter().map(|&value| value as i64));
     let active_variable_weights =
@@ -584,6 +729,9 @@ fn simulate_node(
     let active_has_nan = Array1::from_iter(active.iter().map(|&value| has_nan[value]));
     let active_d_max = Array1::from_iter(active.iter().map(|&value| d_max[value]));
     let active_p_norm = Array1::from_iter(active.iter().map(|&value| p_norm[value]));
+    let active_penalty_offsets =
+        Array1::from_iter(active.iter().map(|&value| penalty_offsets[value]));
+    let active_penalty_ncat = Array1::from_iter(active.iter().map(|&value| penalty_ncat[value]));
     let target_rows = Array1::from_iter(targets.iter().map(|&value| value as i64));
 
     let anchor = scan_node(
@@ -604,6 +752,11 @@ fn simulate_node(
         active_has_nan.view(),
         active_d_max.view(),
         active_p_norm.view(),
+        random_scan,
+        scan_seed,
+        penalty_flat,
+        active_penalty_offsets.view(),
+        active_penalty_ncat.view(),
         target_rows.view(),
         ti_has_nan,
     );
@@ -657,6 +810,80 @@ fn simulate_node(
         strict_fallback_count,
         collapsed_lag_count,
     }
+}
+
+/// Per-domain scan views shared by the main and cleanup engines.
+///
+/// Domain 0 is the primary TI; domains `1..=n_zones` are the zone TIs
+/// (concatenated column-wise in `zone_ti`). For each domain this returns the
+/// TI view, its shape, per-variable `d_max`, the jointly-defined-cell list used
+/// by the unconditional fallback, and whether the TI carries any `NaN`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn build_domains<'a>(
+    ti: ArrayView2<'a, f64>,
+    ti_shape: ArrayView1<'a, i64>,
+    d_max: ArrayView1<'a, f64>,
+    zone_ti: ArrayView2<'a, f64>,
+    zone_offsets: ArrayView1<'_, i64>,
+    zone_shapes: ArrayView2<'a, i64>,
+    zone_d_max: ArrayView2<'a, f64>,
+    variable_count: usize,
+) -> Result<
+    (
+        Vec<ArrayView2<'a, f64>>,
+        Vec<ArrayView1<'a, i64>>,
+        Vec<ArrayView1<'a, f64>>,
+        Vec<Vec<usize>>,
+        Vec<bool>,
+    ),
+    String,
+> {
+    let n_zones = zone_offsets.len().saturating_sub(1);
+    if zone_shapes.dim() != (n_zones, ti_shape.len())
+        || zone_d_max.dim() != (n_zones, variable_count)
+        || (n_zones > 0 && zone_ti.nrows() != variable_count)
+    {
+        return Err("inconsistent MPS zone array shapes".to_owned());
+    }
+    let mut domain_tis: Vec<ArrayView2<'a, f64>> = Vec::with_capacity(n_zones + 1);
+    let mut domain_shapes: Vec<ArrayView1<'a, i64>> = Vec::with_capacity(n_zones + 1);
+    let mut domain_d_max: Vec<ArrayView1<'a, f64>> = Vec::with_capacity(n_zones + 1);
+    domain_tis.push(ti);
+    domain_shapes.push(ti_shape);
+    domain_d_max.push(d_max);
+    for zone in 0..n_zones {
+        let lo = zone_offsets[zone] as usize;
+        let hi = zone_offsets[zone + 1] as usize;
+        // `*_move` consumes a `Copy` of the `'a` view, so the sub-views keep the
+        // input data's lifetime rather than borrowing the local binding.
+        let shape = zone_shapes.index_axis_move(Axis(0), zone);
+        if hi < lo || (hi - lo) != shape.iter().product::<i64>() as usize {
+            return Err("inconsistent MPS zone TI offsets/shape".to_owned());
+        }
+        domain_tis.push(zone_ti.slice_move(s![.., lo..hi]));
+        domain_shapes.push(shape);
+        domain_d_max.push(zone_d_max.index_axis_move(Axis(0), zone));
+    }
+    let mut domain_finite_all: Vec<Vec<usize>> = Vec::with_capacity(n_zones + 1);
+    let mut domain_ti_has_nan: Vec<bool> = Vec::with_capacity(n_zones + 1);
+    for dti in &domain_tis {
+        let has_nan_d = dti.iter().any(|value| value.is_nan());
+        let finite_d: Vec<usize> = (0..dti.ncols())
+            .filter(|&flat| (0..variable_count).all(|v| !dti[(v, flat)].is_nan()))
+            .collect();
+        if has_nan_d && finite_d.is_empty() {
+            return Err("training image has no jointly defined cell".to_owned());
+        }
+        domain_ti_has_nan.push(has_nan_d);
+        domain_finite_all.push(finite_d);
+    }
+    Ok((
+        domain_tis,
+        domain_shapes,
+        domain_d_max,
+        domain_finite_all,
+        domain_ti_has_nan,
+    ))
 }
 
 /// Run one complete MPS simulation with a deterministic scheduler.
@@ -722,12 +949,21 @@ pub fn simulate_engine(
     has_nan: ArrayView1<'_, u8>,
     d_max: ArrayView1<'_, f64>,
     p_norm: ArrayView1<'_, f64>,
+    penalty_flat: ArrayView1<'_, f64>,
+    penalty_offsets: ArrayView1<'_, i64>,
+    penalty_ncat: ArrayView1<'_, i64>,
     threshold: f64,
     scan_fraction: f64,
-    distance_power: f64,
-    cond_weight: f64,
+    random_scan: bool,
+    distance_power: ArrayView1<'_, f64>,
+    cond_weight: ArrayView1<'_, f64>,
     partial_boundary: bool,
     num_threads: usize,
+    zone_ti: ArrayView2<'_, f64>,
+    zone_offsets: ArrayView1<'_, i64>,
+    zone_shapes: ArrayView2<'_, i64>,
+    zone_d_max: ArrayView2<'_, f64>,
+    node_domain: ArrayView1<'_, i64>,
 ) -> Result<SimulationOutput, String> {
     let variable_count = ti.nrows();
     let ti_size = ti_shape.iter().product::<i64>() as usize;
@@ -749,17 +985,34 @@ pub fn simulate_engine(
         || has_nan.len() != variable_count
         || d_max.len() != variable_count
         || p_norm.len() != variable_count
+        || distance_power.len() != variable_count
+        || cond_weight.len() != variable_count
+        || penalty_offsets.len() != variable_count
+        || penalty_ncat.len() != variable_count
+        || node_domain.len() != path.nrows()
     {
         return Err("inconsistent MPS simulation-engine array shapes".to_owned());
     }
 
-    let ti_has_nan = ti.iter().any(|value| value.is_nan());
-    let finite_all: Vec<usize> = (0..ti_size)
-        .filter(|&flat| (0..variable_count).all(|variable| !ti[(variable, flat)].is_nan()))
-        .collect();
-    if ti_has_nan && finite_all.is_empty() {
-        return Err("training image has no jointly defined cell".to_owned());
+    // Domain 0 is the primary TI; domains 1.. are the zone TIs. `node_domain`
+    // selects a domain per path node. A zero-length `node_domain`/`zone_*`
+    // configuration (no zones) leaves every node on the primary TI, so the
+    // whole run is identical to the single-TI path.
+    let n_zones = zone_offsets.len().saturating_sub(1);
+    if node_domain.iter().any(|&d| d < 0 || d as usize > n_zones) {
+        return Err("inconsistent MPS zone array shapes".to_owned());
     }
+    let (domain_tis, domain_shapes, domain_d_max, domain_finite_all, domain_ti_has_nan) =
+        build_domains(
+            ti,
+            ti_shape,
+            d_max,
+            zone_ti,
+            zone_offsets,
+            zone_shapes,
+            zone_d_max,
+            variable_count,
+        )?;
 
     let cache = build_neighbor_cache(
         path,
@@ -803,12 +1056,17 @@ pub fn simulate_engine(
     let mut collapsed_lag_count = 0_usize;
     for ready in &levels {
         let calculate = |node: &usize| {
+            // Pick this node's domain (0 = primary TI, k = zones[k-1]); only the
+            // scanned TI, its shape, range, missingness and defined-cell list
+            // change. Neighbour gathering (build_neighbor_cache) is grid-based
+            // and zone-agnostic, so data events cross zone boundaries.
+            let domain = node_domain[*node] as usize;
             simulate_node(
                 *node,
                 &cache[*node],
                 fields.view(),
-                ti,
-                ti_shape,
+                domain_tis[domain],
+                domain_shapes[domain],
                 sim_shape,
                 path,
                 lag_matrices,
@@ -818,15 +1076,20 @@ pub fn simulate_engine(
                 variable_weights,
                 metric_kinds,
                 has_nan,
-                d_max,
+                domain_d_max[domain],
                 p_norm,
+                penalty_flat,
+                penalty_offsets,
+                penalty_ncat,
                 threshold,
                 scan_fraction,
+                random_scan,
                 distance_power,
                 cond_weight,
                 partial_boundary,
-                &finite_all,
-                ti_has_nan,
+                &domain_finite_all[domain],
+                domain_ti_has_nan[domain],
+                false,
             )
         };
         let results: Vec<NodeResult> = if let Some(pool) = &pool {
@@ -859,6 +1122,206 @@ pub fn simulate_engine(
     })
 }
 
+/// Run one deterministic post-processing (cleanup) pass (Meerschman et al.
+/// 2013, Sect. 4).
+///
+/// Re-simulates every node of `path` against an already-complete field as a
+/// Gauss-Seidel sweep: each node reads the refreshed values of earlier-visited
+/// neighbours and the stale values of later ones, so one pass refines the
+/// realization instead of redrawing it. The sweep is expressed as the
+/// position-oriented dependency DAG of [`build_cleanup_levels`] and run with
+/// the same level scheduler as [`simulate_engine`], so the output is
+/// **bit-identical for any `num_threads`** (serial == parallel).
+///
+/// Each node's non-conditioned variables are its scan targets (their stale
+/// value suppressed as a self-constraint via [`simulate_node`]'s `cleanup`
+/// mode); conditioned (hard) variables are never rewritten and still act as
+/// `h = 0` collocated constraints. The search config (TI, metrics, weights,
+/// `n_neighbors`, `scan_fraction`, penalties) is the caller's *effective*
+/// post-pass config, so a `metric_kinds`/paste-rule override (e.g.
+/// variation↔Lp) takes effect here, including the variation mean-shift which
+/// [`simulate_node`] keys off `metric_kinds`.
+///
+/// `fields_in` is the complete current field; the returned array is the updated
+/// field. Arguments mirror [`simulate_engine`]; `path` is this pass's
+/// eligible-node visit order and `u_start`/`u_fallback` are its per-node draws.
+/// Returns the field plus the strict-fallback count, collapsed-lag count, and
+/// the effective thread count after the small-path cutoff.
+#[allow(clippy::too_many_arguments)]
+pub fn cleanup_pass_engine(
+    ti: ArrayView2<'_, f64>,
+    ti_shape: ArrayView1<'_, i64>,
+    fields_in: ArrayView2<'_, f64>,
+    conditioned: ArrayView2<'_, u8>,
+    sim_shape: ArrayView1<'_, i64>,
+    path: ArrayView2<'_, i64>,
+    lag_matrices: ArrayView3<'_, f64>,
+    u_start: ArrayView1<'_, f64>,
+    u_fallback: ArrayView2<'_, f64>,
+    offsets: ArrayView2<'_, i64>,
+    n_neighbors: ArrayView1<'_, i64>,
+    max_radius: ArrayView1<'_, f64>,
+    variable_weights: ArrayView1<'_, f64>,
+    metric_kinds: ArrayView1<'_, i64>,
+    has_nan: ArrayView1<'_, u8>,
+    d_max: ArrayView1<'_, f64>,
+    p_norm: ArrayView1<'_, f64>,
+    penalty_flat: ArrayView1<'_, f64>,
+    penalty_offsets: ArrayView1<'_, i64>,
+    penalty_ncat: ArrayView1<'_, i64>,
+    threshold: f64,
+    scan_fraction: f64,
+    random_scan: bool,
+    distance_power: ArrayView1<'_, f64>,
+    cond_weight: ArrayView1<'_, f64>,
+    partial_boundary: bool,
+    num_threads: usize,
+    zone_ti: ArrayView2<'_, f64>,
+    zone_offsets: ArrayView1<'_, i64>,
+    zone_shapes: ArrayView2<'_, i64>,
+    zone_d_max: ArrayView2<'_, f64>,
+    node_domain: ArrayView1<'_, i64>,
+) -> Result<(Array2<f64>, usize, usize, usize), String> {
+    let variable_count = ti.nrows();
+    let ti_size = ti_shape.iter().product::<i64>() as usize;
+    let sg_size = sim_shape.iter().product::<i64>() as usize;
+    if variable_count == 0
+        || ti.ncols() != ti_size
+        || fields_in.dim() != (variable_count, sg_size)
+        || conditioned.dim() != fields_in.dim()
+        || path.ncols() != sim_shape.len()
+        || (!lag_matrices.is_empty()
+            && lag_matrices.dim() != (path.nrows(), sim_shape.len(), sim_shape.len()))
+        || u_start.len() != path.nrows()
+        || u_fallback.dim() != (path.nrows(), sim_shape.len())
+        || offsets.ncols() != sim_shape.len()
+        || n_neighbors.len() != variable_count
+        || max_radius.len() != variable_count
+        || variable_weights.len() != variable_count
+        || metric_kinds.len() != variable_count
+        || has_nan.len() != variable_count
+        || d_max.len() != variable_count
+        || p_norm.len() != variable_count
+        || distance_power.len() != variable_count
+        || cond_weight.len() != variable_count
+        || penalty_offsets.len() != variable_count
+        || penalty_ncat.len() != variable_count
+        || node_domain.len() != path.nrows()
+    {
+        return Err("inconsistent MPS cleanup-engine array shapes".to_owned());
+    }
+    let n_zones = zone_offsets.len().saturating_sub(1);
+    if node_domain.iter().any(|&d| d < 0 || d as usize > n_zones) {
+        return Err("inconsistent MPS zone array shapes".to_owned());
+    }
+    let (domain_tis, domain_shapes, domain_d_max, domain_finite_all, domain_ti_has_nan) =
+        build_domains(
+            ti,
+            ti_shape,
+            d_max,
+            zone_ti,
+            zone_offsets,
+            zone_shapes,
+            zone_d_max,
+            variable_count,
+        )?;
+
+    // One neighbour cache feeds both the dependency DAG and the per-node scan.
+    let cache = build_cleanup_neighbor_cache(
+        path,
+        sim_shape,
+        offsets,
+        n_neighbors,
+        max_radius,
+        variable_count,
+    );
+    let (levels, _level_count, _max_width) = build_cleanup_levels(&cache, path, sim_shape);
+
+    // Same small-path cutoff and one-pool policy as simulate_engine.
+    let used_threads = if num_threads > 1 && path.nrows() >= 512 {
+        num_threads
+    } else {
+        1
+    };
+    let pool: Option<ThreadPool> = if used_threads > 1 {
+        Some(
+            ThreadPoolBuilder::new()
+                .num_threads(used_threads)
+                .build()
+                .map_err(|error| format!("could not build MPS Rayon pool: {error}"))?,
+        )
+    } else {
+        None
+    };
+
+    let mut fields = fields_in.to_owned();
+    let mut strict_fallback_count = 0_usize;
+    let mut collapsed_lag_count = 0_usize;
+    for ready in &levels {
+        let calculate = |node: &usize| {
+            let domain = node_domain[*node] as usize;
+            simulate_node(
+                *node,
+                &cache[*node],
+                fields.view(),
+                domain_tis[domain],
+                domain_shapes[domain],
+                sim_shape,
+                path,
+                lag_matrices,
+                u_start,
+                u_fallback,
+                conditioned,
+                variable_weights,
+                metric_kinds,
+                has_nan,
+                domain_d_max[domain],
+                p_norm,
+                penalty_flat,
+                penalty_offsets,
+                penalty_ncat,
+                threshold,
+                scan_fraction,
+                random_scan,
+                distance_power,
+                cond_weight,
+                partial_boundary,
+                &domain_finite_all[domain],
+                domain_ti_has_nan[domain],
+                true,
+            )
+        };
+        let results: Vec<NodeResult> = if let Some(pool) = &pool {
+            pool.install(|| ready.par_iter().map(calculate).collect())
+        } else {
+            ready.iter().map(calculate).collect()
+        };
+        // Commit after the level: within a level no node reads another (an edge
+        // would force distinct levels), so the snapshot the closure read is the
+        // correct Gauss-Seidel state and writes are to disjoint cells.
+        for result in results {
+            strict_fallback_count += result.strict_fallback_count;
+            collapsed_lag_count += result.collapsed_lag_count;
+            for (variable, value) in result.values {
+                if value.is_nan() {
+                    return Err(format!(
+                        "cleanup produced NaN for variable {variable} at flat node {}",
+                        result.flat
+                    ));
+                }
+                fields[(variable, result.flat)] = value;
+            }
+        }
+    }
+
+    Ok((
+        fields,
+        strict_fallback_count,
+        collapsed_lag_count,
+        used_threads,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,12 +1346,21 @@ mod tests {
             array![0_u8].view(),
             array![1.0].view(),
             array![1.0].view(),
-            0.0,
-            1.0,
+            Array1::<f64>::zeros(0).view(),
+            array![0_i64].view(),
+            array![0_i64].view(),
             0.0,
             1.0,
             false,
+            array![0.0].view(),
+            array![1.0].view(),
+            false,
             num_threads,
+            Array2::<f64>::zeros((1, 0)).view(),
+            array![0_i64].view(),
+            Array2::<i64>::zeros((0, 1)).view(),
+            Array2::<f64>::zeros((0, 1)).view(),
+            array![0_i64, 0_i64].view(),
         )
         .expect("valid fixture")
     }
@@ -935,6 +1407,87 @@ mod tests {
         assert!(!strict_fallback);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn cleanup_fixture(u_start: Array1<f64>, num_threads: usize) -> (Array2<f64>, usize, usize) {
+        let (fields, strict, collapsed, _used) = cleanup_pass_engine(
+            array![[0.0, 1.0, 1.0, 0.0]].view(),
+            array![4_i64].view(),
+            array![[0.0, 0.0, 1.0]].view(),
+            array![[1_u8, 0, 0]].view(),
+            array![3_i64].view(),
+            array![[1_i64], [2_i64]].view(),
+            Array3::<f64>::zeros((0, 1, 1)).view(),
+            u_start.view(),
+            array![[0.25], [0.75]].view(),
+            array![[-1_i64], [1_i64]].view(),
+            array![1_i64].view(),
+            array![f64::NAN].view(),
+            array![1.0].view(),
+            array![0_i64].view(),
+            array![0_u8].view(),
+            array![1.0].view(),
+            array![1.0].view(),
+            Array1::<f64>::zeros(0).view(),
+            array![0_i64].view(),
+            array![0_i64].view(),
+            0.0,
+            1.0,
+            false,
+            array![0.0].view(),
+            array![1.0].view(),
+            false,
+            num_threads,
+            Array2::<f64>::zeros((1, 0)).view(),
+            array![0_i64].view(),
+            Array2::<i64>::zeros((0, 1)).view(),
+            Array2::<f64>::zeros((0, 1)).view(),
+            array![0_i64, 0_i64].view(),
+        )
+        .expect("valid cleanup fixture");
+        (fields, strict, collapsed)
+    }
+
+    #[test]
+    fn cleanup_pass_preserves_hard_data_and_is_gauss_seidel() {
+        let (fields, strict, collapsed) = cleanup_fixture(array![0.25, 0.5], 1);
+        // Node 0 is hard-conditioned and must be untouched.
+        assert_eq!(fields[(0, 0)], 0.0);
+        // Node 1 reopens, its only neighbour is the hard 0 at lag -1; the unique
+        // distance-0 TI anchor is y=1 (TI[0]==0), pasting TI[1]==1. Node 2 then
+        // reads node 1's refreshed 1 (Gauss-Seidel) and pastes 1 as well.
+        assert_eq!(fields, array![[0.0, 1.0, 1.0]]);
+        assert_eq!(strict, 0);
+        assert_eq!(collapsed, 0);
+    }
+
+    #[test]
+    fn cleanup_pass_is_deterministic() {
+        let a = cleanup_fixture(array![0.25, 0.5], 1).0;
+        let b = cleanup_fixture(array![0.25, 0.5], 1).0;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cleanup_levels_order_mutual_neighbours_by_visit_position() {
+        // Three colinear eligible nodes 0,1,2 at positions 0,1,2 with nearest
+        // neighbours: each adjacent pair is an edge, so levels are 0,1,2 (a
+        // chain) -- the Gauss-Seidel sweep cannot parallelise colinear reads.
+        let path = array![[0_i64], [1_i64], [2_i64]];
+        let cache = build_cleanup_neighbor_cache(
+            path.view(),
+            array![3_i64].view(),
+            array![[-1_i64], [1_i64]].view(),
+            array![2_i64].view(),
+            array![f64::NAN].view(),
+            1,
+        );
+        let (levels, level_count, max_width) =
+            build_cleanup_levels(&cache, path.view(), array![3_i64].view());
+        assert_eq!(level_count, 3);
+        assert_eq!(max_width, 1);
+        assert_eq!(levels, vec![vec![0], vec![1], vec![2]]);
+    }
+
     #[test]
     fn variation_retrieval_applies_mean_shift() {
         let output = simulate_engine(
@@ -955,12 +1508,21 @@ mod tests {
             array![0_u8].view(),
             array![11.0].view(),
             array![2.0].view(),
+            Array1::<f64>::zeros(0).view(),
+            array![0_i64].view(),
+            array![0_i64].view(),
             1.0,
-            1.0,
-            0.0,
             1.0,
             false,
+            array![0.0].view(),
+            array![1.0].view(),
+            false,
             1,
+            Array2::<f64>::zeros((1, 0)).view(),
+            array![0_i64].view(),
+            Array2::<i64>::zeros((0, 1)).view(),
+            Array2::<f64>::zeros((0, 1)).view(),
+            array![0_i64].view(),
         )
         .expect("valid variation fixture");
         assert_eq!(output.fields[(0, 1)], 6.0);
