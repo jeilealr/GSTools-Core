@@ -470,18 +470,6 @@ fn transform_and_reduce_event(
     collapsed
 }
 
-fn nanmean(values: impl Iterator<Item = f64>) -> Option<f64> {
-    let mut sum = 0.0_f64;
-    let mut count = 0_usize;
-    for value in values {
-        if !value.is_nan() {
-            sum += value;
-            count += 1;
-        }
-    }
-    (count > 0).then_some(sum / count as f64)
-}
-
 fn fallback_flat(
     node: usize,
     u_fallback: ArrayView2<'_, f64>,
@@ -579,6 +567,20 @@ fn simulate_node(
     let mut events = Vec::with_capacity(fields.nrows());
     let mut collapsed_lag_count = 0_usize;
     for variable in 0..fields.nrows() {
+        // Zero-weight variables are excluded from the search BEFORE geometry
+        // (audit DS03): an empty event places no constraint on the TI-window
+        // intersection and is never scored, so an ignored variable cannot
+        // discard a valid positive-weight match. Its centre is still pasted
+        // from the chosen anchor (targets are independent of weight).
+        if variable_weights[variable] == 0.0 {
+            events.push(Event {
+                values: Vec::new(),
+                conditioned: Vec::new(),
+                lags: Vec::new(),
+                lag_norms: Vec::new(),
+            });
+            continue;
+        }
         let collocated = !is_target(variable);
         let capacity = cached.by_variable[variable].len() + usize::from(collocated);
         let mut event = Event {
@@ -785,22 +787,38 @@ fn simulate_node(
             if metric_kinds[variable] != 2 || events[variable].len() == 0 {
                 return (variable, center);
             }
-            let ti_event = events[variable].lags.iter().map(|lag| {
+            // Common-support mean shift (audit DS04): average SG - TI over only
+            // the lags where BOTH the SG event value and the anchored TI value
+            // are finite — the exact support the variation score used. The
+            // earlier code averaged the SG and TI events over different
+            // supports (nanmean of each independently), which shifted the paste
+            // by a value the score never saw.
+            let event = &events[variable];
+            let mut shift_sum = 0.0_f64;
+            let mut common = 0_usize;
+            for (index, lag) in event.lags.iter().enumerate() {
+                let sg_value = event.values[index];
+                if !sg_value.is_finite() {
+                    continue;
+                }
                 let lag_flat: i64 = lag
                     .iter()
                     .zip(ti_strides.iter())
                     .map(|(&component, &stride)| component * stride)
                     .sum();
-                ti[(variable, (anchor_flat as i64 + lag_flat) as usize)]
-            });
-            let ti_values: Vec<f64> = ti_event.collect();
-            let ti_mean = if ti_values.iter().any(|value| value.is_finite()) {
-                nanmean(ti_values.iter().copied()).unwrap_or(0.0)
+                let ti_value = ti[(variable, (anchor_flat as i64 + lag_flat) as usize)];
+                if !ti_value.is_finite() {
+                    continue;
+                }
+                shift_sum += sg_value - ti_value;
+                common += 1;
+            }
+            let shift = if common > 0 {
+                shift_sum / common as f64
             } else {
                 0.0
             };
-            let sim_mean = nanmean(events[variable].values.iter().copied()).unwrap_or(0.0);
-            (variable, center - ti_mean + sim_mean)
+            (variable, center + shift)
         })
         .collect();
 
@@ -819,10 +837,45 @@ fn simulate_node(
 /// TI view, its shape, per-variable `d_max`, the jointly-defined-cell list used
 /// by the unconditional fallback, and whether the TI carries any `NaN`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// Validate the *contents* (not just the shapes) that the engines will index
+/// or that must be finite, returning a controlled error instead of letting a
+/// later out-of-bounds index or `0 * inf` abort the release process (audit
+/// DS05). NaN is the legitimate missing-value marker and is allowed; only
+/// infinities are rejected in the TI data.
+fn validate_engine_inputs(
+    path: ArrayView2<'_, i64>,
+    sim_shape: ArrayView1<'_, i64>,
+    u_start: ArrayView1<'_, f64>,
+    u_fallback: ArrayView2<'_, f64>,
+    ti: ArrayView2<'_, f64>,
+    zone_ti: ArrayView2<'_, f64>,
+) -> Result<(), String> {
+    for coords in path.rows() {
+        for axis in 0..sim_shape.len() {
+            if coords[axis] < 0 || coords[axis] >= sim_shape[axis] {
+                return Err("MPS path coordinate out of simulation-grid bounds".to_owned());
+            }
+        }
+    }
+    if u_start
+        .iter()
+        .chain(u_fallback.iter())
+        .any(|&u| !(0.0..1.0).contains(&u))
+    {
+        return Err("MPS random uniforms must lie in [0, 1)".to_owned());
+    }
+    if ti.iter().chain(zone_ti.iter()).any(|&v| v.is_infinite()) {
+        return Err("MPS training image contains a non-finite (infinite) value".to_owned());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn build_domains<'a>(
     ti: ArrayView2<'a, f64>,
     ti_shape: ArrayView1<'a, i64>,
     d_max: ArrayView1<'a, f64>,
+    has_nan: ArrayView1<'_, u8>,
     zone_ti: ArrayView2<'a, f64>,
     zone_offsets: ArrayView1<'_, i64>,
     zone_shapes: ArrayView2<'a, i64>,
@@ -835,6 +888,7 @@ fn build_domains<'a>(
         Vec<ArrayView1<'a, f64>>,
         Vec<Vec<usize>>,
         Vec<bool>,
+        Vec<Array1<u8>>,
     ),
     String,
 > {
@@ -857,7 +911,7 @@ fn build_domains<'a>(
         // `*_move` consumes a `Copy` of the `'a` view, so the sub-views keep the
         // input data's lifetime rather than borrowing the local binding.
         let shape = zone_shapes.index_axis_move(Axis(0), zone);
-        if hi < lo || (hi - lo) != shape.iter().product::<i64>() as usize {
+        if hi < lo || hi > zone_ti.ncols() || (hi - lo) != shape.iter().product::<i64>() as usize {
             return Err("inconsistent MPS zone TI offsets/shape".to_owned());
         }
         domain_tis.push(zone_ti.slice_move(s![.., lo..hi]));
@@ -866,7 +920,12 @@ fn build_domains<'a>(
     }
     let mut domain_finite_all: Vec<Vec<usize>> = Vec::with_capacity(n_zones + 1);
     let mut domain_ti_has_nan: Vec<bool> = Vec::with_capacity(n_zones + 1);
-    for dti in &domain_tis {
+    // Per-domain, per-variable missingness (audit DS17): the masked/unmasked
+    // kernel choice must follow the SELECTED domain's data, not the primary's.
+    // Domain 0 reuses the Python-supplied primary flags; each zone's flags are
+    // recomputed from that zone's own TI columns.
+    let mut domain_has_nan: Vec<Array1<u8>> = Vec::with_capacity(n_zones + 1);
+    for (domain, dti) in domain_tis.iter().enumerate() {
         let has_nan_d = dti.iter().any(|value| value.is_nan());
         let finite_d: Vec<usize> = (0..dti.ncols())
             .filter(|&flat| (0..variable_count).all(|v| !dti[(v, flat)].is_nan()))
@@ -876,6 +935,14 @@ fn build_domains<'a>(
         }
         domain_ti_has_nan.push(has_nan_d);
         domain_finite_all.push(finite_d);
+        if domain == 0 {
+            domain_has_nan.push(has_nan.to_owned());
+        } else {
+            domain_has_nan
+                .push(Array1::from_iter((0..variable_count).map(|v| {
+                    u8::from((0..dti.ncols()).any(|flat| dti[(v, flat)].is_nan()))
+                })));
+        }
     }
     Ok((
         domain_tis,
@@ -883,6 +950,7 @@ fn build_domains<'a>(
         domain_d_max,
         domain_finite_all,
         domain_ti_has_nan,
+        domain_has_nan,
     ))
 }
 
@@ -993,6 +1061,7 @@ pub fn simulate_engine(
     {
         return Err("inconsistent MPS simulation-engine array shapes".to_owned());
     }
+    validate_engine_inputs(path, sim_shape, u_start, u_fallback, ti, zone_ti)?;
 
     // Domain 0 is the primary TI; domains 1.. are the zone TIs. `node_domain`
     // selects a domain per path node. A zero-length `node_domain`/`zone_*`
@@ -1002,17 +1071,24 @@ pub fn simulate_engine(
     if node_domain.iter().any(|&d| d < 0 || d as usize > n_zones) {
         return Err("inconsistent MPS zone array shapes".to_owned());
     }
-    let (domain_tis, domain_shapes, domain_d_max, domain_finite_all, domain_ti_has_nan) =
-        build_domains(
-            ti,
-            ti_shape,
-            d_max,
-            zone_ti,
-            zone_offsets,
-            zone_shapes,
-            zone_d_max,
-            variable_count,
-        )?;
+    let (
+        domain_tis,
+        domain_shapes,
+        domain_d_max,
+        domain_finite_all,
+        domain_ti_has_nan,
+        domain_has_nan,
+    ) = build_domains(
+        ti,
+        ti_shape,
+        d_max,
+        has_nan,
+        zone_ti,
+        zone_offsets,
+        zone_shapes,
+        zone_d_max,
+        variable_count,
+    )?;
 
     let cache = build_neighbor_cache(
         path,
@@ -1075,7 +1151,7 @@ pub fn simulate_engine(
                 conditioned,
                 variable_weights,
                 metric_kinds,
-                has_nan,
+                domain_has_nan[domain].view(),
                 domain_d_max[domain],
                 p_norm,
                 penalty_flat,
@@ -1101,9 +1177,9 @@ pub fn simulate_engine(
             strict_fallback_count += result.strict_fallback_count;
             collapsed_lag_count += result.collapsed_lag_count;
             for (variable, value) in result.values {
-                if value.is_nan() {
+                if !value.is_finite() {
                     return Err(format!(
-                        "simulation produced NaN for variable {variable} at flat node {}",
+                        "simulation produced a non-finite value for variable {variable} at flat node {}",
                         result.flat
                     ));
                 }
@@ -1210,21 +1286,29 @@ pub fn cleanup_pass_engine(
     {
         return Err("inconsistent MPS cleanup-engine array shapes".to_owned());
     }
+    validate_engine_inputs(path, sim_shape, u_start, u_fallback, ti, zone_ti)?;
     let n_zones = zone_offsets.len().saturating_sub(1);
     if node_domain.iter().any(|&d| d < 0 || d as usize > n_zones) {
         return Err("inconsistent MPS zone array shapes".to_owned());
     }
-    let (domain_tis, domain_shapes, domain_d_max, domain_finite_all, domain_ti_has_nan) =
-        build_domains(
-            ti,
-            ti_shape,
-            d_max,
-            zone_ti,
-            zone_offsets,
-            zone_shapes,
-            zone_d_max,
-            variable_count,
-        )?;
+    let (
+        domain_tis,
+        domain_shapes,
+        domain_d_max,
+        domain_finite_all,
+        domain_ti_has_nan,
+        domain_has_nan,
+    ) = build_domains(
+        ti,
+        ti_shape,
+        d_max,
+        has_nan,
+        zone_ti,
+        zone_offsets,
+        zone_shapes,
+        zone_d_max,
+        variable_count,
+    )?;
 
     // One neighbour cache feeds both the dependency DAG and the per-node scan.
     let cache = build_cleanup_neighbor_cache(
@@ -1274,7 +1358,7 @@ pub fn cleanup_pass_engine(
                 conditioned,
                 variable_weights,
                 metric_kinds,
-                has_nan,
+                domain_has_nan[domain].view(),
                 domain_d_max[domain],
                 p_norm,
                 penalty_flat,
@@ -1303,9 +1387,9 @@ pub fn cleanup_pass_engine(
             strict_fallback_count += result.strict_fallback_count;
             collapsed_lag_count += result.collapsed_lag_count;
             for (variable, value) in result.values {
-                if value.is_nan() {
+                if !value.is_finite() {
                     return Err(format!(
-                        "cleanup produced NaN for variable {variable} at flat node {}",
+                        "cleanup produced a non-finite value for variable {variable} at flat node {}",
                         result.flat
                     ));
                 }

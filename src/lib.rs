@@ -238,15 +238,30 @@ mod gstools_core {
         base_flat: PyReadonlyArray1<i64>,
         lag_flat: PyReadonlyArray1<i64>,
         node_weights: PyReadonlyArray1<f64>,
-    ) -> Bound<'py, PyArray1<f64>> {
-        dist_block_categorical(
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        // Audit DS05: a negative or out-of-range flattened index would panic on
+        // `ti_flat[(base + lag) as usize]` and abort the release process; raise
+        // a controlled error instead. (The other mps_dist_block_* kernels share
+        // this base+lag indexing and the same guard pattern.)
+        let ti_len = ti_flat.as_array().len() as i64;
+        for &base in base_flat.as_array().iter() {
+            for &lag in lag_flat.as_array().iter() {
+                let index = base.saturating_add(lag);
+                if index < 0 || index >= ti_len {
+                    return Err(PyValueError::new_err(
+                        "mps_dist_block_cat: flattened TI index out of bounds",
+                    ));
+                }
+            }
+        }
+        Ok(dist_block_categorical(
             de_sim.as_array(),
             ti_flat.as_array(),
             base_flat.as_array(),
             lag_flat.as_array(),
             node_weights.as_array(),
         )
-        .into_pyarray(py)
+        .into_pyarray(py))
     }
 
     #[pyfunction(name = "mps_dist_block_cat_rayon")]

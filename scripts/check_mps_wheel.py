@@ -1,4 +1,10 @@
-"""Smoke-test the MPS exports of an installed gstools-core wheel."""
+"""Smoke-test the MPS exports of an installed gstools-core wheel.
+
+Calls the current ABI-7 ``mps_simulate`` / ``mps_cleanup_pass`` signatures with
+explicit keyword arguments so a future positional change fails loudly here
+(audit DS19). Requires the versioned API export and the cleanup entry point in
+addition to the distance/scan/simulate kernels.
+"""
 
 from __future__ import annotations
 
@@ -22,13 +28,62 @@ REQUIRED_EXPORTS = (
     "mps_scan_node",
     "mps_scan_node_cat",
     "mps_simulate",
+    "mps_cleanup_pass",
+    "mps_api_version",
 )
+
+# Minimum MPS native ABI revision this smoke test targets.
+REQUIRED_API = 7
+
+
+def _engine_kwargs(num_threads=1):
+    """Keyword arguments for a one-cell categorical ``mps_simulate`` call."""
+    return dict(
+        ti=np.array([[0.0, 1.0]]),
+        ti_shape=np.array([2], dtype=np.int64),
+        initial_fields=np.array([[np.nan]]),
+        conditioned=np.zeros((1, 1), dtype=np.uint8),
+        sim_shape=np.array([1], dtype=np.int64),
+        path=np.array([[0]], dtype=np.int64),
+        lag_matrices=np.empty((0, 1, 1)),
+        u_start=np.array([0.0]),
+        u_fallback=np.array([[0.1]]),
+        offsets=np.empty((0, 1), dtype=np.int64),
+        n_neighbors=np.array([1], dtype=np.int64),
+        max_radius=np.array([np.nan]),
+        variable_weights=np.array([1.0]),
+        metric_kinds=np.array([0], dtype=np.int64),
+        has_nan=np.array([0], dtype=np.uint8),
+        d_max=np.array([1.0]),
+        p_norm=np.array([1.0]),
+        penalty_flat=np.empty(0),
+        penalty_offsets=np.zeros(1, dtype=np.int64),
+        penalty_ncat=np.zeros(1, dtype=np.int64),
+        threshold=0.0,
+        scan_fraction=1.0,
+        random_scan=False,
+        distance_power=np.zeros(1),
+        cond_weight=np.ones(1),
+        partial_boundary=False,
+        num_threads=num_threads,
+        zone_ti=np.empty((1, 0)),
+        zone_offsets=np.array([0], dtype=np.int64),
+        zone_shapes=np.empty((0, 1), dtype=np.int64),
+        zone_d_max=np.empty((0, 1)),
+        node_domain=np.zeros(1, dtype=np.int64),
+    )
 
 
 def main() -> None:
     missing = [name for name in REQUIRED_EXPORTS if not hasattr(gstools_core, name)]
     if missing:
         raise RuntimeError(f"installed wheel is missing MPS exports: {missing}")
+
+    api = int(gstools_core.mps_api_version())
+    if api < REQUIRED_API:
+        raise RuntimeError(
+            f"installed wheel reports MPS ABI {api}, need >= {REQUIRED_API}"
+        )
 
     distance = gstools_core.mps_dist_block_cat(
         np.array([0.1]),
@@ -39,41 +94,26 @@ def main() -> None:
     )
     np.testing.assert_array_equal(distance, np.array([1.0]))
 
-    result = gstools_core.mps_simulate(
-        np.array([[0.0, 1.0]]),
-        np.array([2], dtype=np.int64),
-        np.array([[np.nan]]),
-        np.zeros((1, 1), dtype=np.uint8),
-        np.array([1], dtype=np.int64),
-        np.array([[0]], dtype=np.int64),
-        np.empty((0, 1, 1)),
-        np.array([0.0]),
-        np.array([[0.1]]),
-        np.empty((0, 1), dtype=np.int64),
-        np.array([1], dtype=np.int64),
-        np.array([np.nan]),
-        np.array([1.0]),
-        np.array([0], dtype=np.int64),
-        np.array([0], dtype=np.uint8),
-        np.array([1.0]),
-        np.array([1.0]),
-        0.0,
-        1.0,
-        0.0,
-        1.0,
-        False,
-        1,
+    field, strict_fallbacks, levels, ready_width, threads, collapsed = (
+        gstools_core.mps_simulate(**_engine_kwargs())
     )
-    field, strict_fallbacks, levels, ready_width, threads, collapsed = result
     np.testing.assert_array_equal(field, np.array([[0.0]]))
-    assert (strict_fallbacks, levels, ready_width, threads, collapsed) == (
-        0,
-        1,
-        1,
-        1,
-        0,
+    assert (strict_fallbacks, levels, ready_width, threads, collapsed) == (0, 1, 1, 1, 0)
+
+    # Cleanup smoke check: a complete one-cell field is re-simulated in place.
+    cleanup_kwargs = {
+        key: value
+        for key, value in _engine_kwargs().items()
+        if key not in {"initial_fields"}
+    }
+    cleanup_kwargs["fields_in"] = np.array([[0.0]])
+    cleaned, c_strict, c_collapsed, c_threads = gstools_core.mps_cleanup_pass(
+        **cleanup_kwargs
     )
-    print("gstools-core MPS wheel smoke test: PASS")
+    np.testing.assert_array_equal(cleaned, np.array([[0.0]]))
+    assert (c_strict, c_collapsed, c_threads) == (0, 0, 1)
+
+    print(f"gstools-core MPS wheel smoke test (API {api}): PASS")
 
 
 if __name__ == "__main__":

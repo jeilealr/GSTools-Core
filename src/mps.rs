@@ -7,6 +7,7 @@
 
 use ndarray::{s, Array1, ArrayView1, ArrayView2};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use std::collections::HashMap;
 
 #[inline]
 fn categorical_candidate_distance(
@@ -779,8 +780,16 @@ pub fn scan_node_categorical(
     node_weights: ArrayView1<'_, f64>,
 ) -> Option<Array1<i64>> {
     let dim = lo.len();
+    // Audit DS05: a degenerate or empty window would abort on `% win_size` or
+    // `dim - 1`; return "no match" instead.
+    if dim == 0 {
+        return None;
+    }
     let win_shape_u: Vec<usize> = win_shape.iter().map(|&s| s as usize).collect();
     let win_size: usize = win_shape_u.iter().product();
+    if win_size == 0 {
+        return None;
+    }
 
     // C-order strides into the window (not the TI)
     let mut win_strides = vec![1usize; dim];
@@ -836,26 +845,64 @@ const METRIC_LP: i64 = 1;
 const METRIC_VARIATION: i64 = 2;
 const METRIC_CATEGORICAL_PENALTY: i64 = 3;
 
-/// `count` DISTINCT window positions in `[0, win_size)`, in a node-local random
-/// order keyed on `scan_seed`.
-///
-/// Uses a full-period LCG over the next-power-of-two modulus `m >= win_size`
-/// (Knuth MMIX multiplier, `a ≡ 1 mod 4`; odd increment -> Hull–Dobell full
-/// period). Out-of-range draws are skipped; over one period all `win_size`
-/// in-range values appear exactly once, so `count <= win_size` yields distinct
-/// positions. Memory is `O(count)` (the scan budget) — never a permutation of
-/// the whole window. Determinism is independent of thread scheduling.
-fn random_scan_positions(win_size: usize, scan_seed: u64, count: usize) -> Vec<usize> {
-    const LCG_A: u64 = 6364136223846793005;
-    let mask = (win_size as u64).next_power_of_two() - 1;
-    let increment = scan_seed | 1;
-    let mut state = scan_seed & mask;
-    let mut out = Vec::with_capacity(count);
-    while out.len() < count {
-        state = LCG_A.wrapping_mul(state).wrapping_add(increment) & mask;
-        if (state as usize) < win_size {
-            out.push(state as usize);
+/// One step of a SplitMix64 PRNG; good avalanche, no low-bit structure.
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Uniform integer in `[0, bound)` via Lemire's method with rejection; unbiased
+/// (no modulo bias), `bound > 0`.
+#[inline]
+fn bounded_u64(state: &mut u64, bound: u64) -> u64 {
+    let mut product = (splitmix64(state) as u128) * (bound as u128);
+    let mut low = product as u64;
+    if low < bound {
+        let threshold = bound.wrapping_neg() % bound;
+        while low < threshold {
+            product = (splitmix64(state) as u128) * (bound as u128);
+            low = product as u64;
         }
+    }
+    (product >> 64) as u64
+}
+
+/// `count` DISTINCT window positions in `[0, win_size)`, uniformly sampled
+/// WITHOUT replacement in a node-local order keyed on `scan_seed`.
+///
+/// Partial Fisher–Yates over the virtual window `[0, win_size)`, with a sparse
+/// map holding only the entries that were swapped, so memory and time are
+/// `O(count)` (the scan budget) — never a full-window permutation. Because the
+/// first draw is uniform over the whole window and each subsequent draw is
+/// uniform over the remaining positions, the generated *prefix* of any length
+/// is an unbiased sample without replacement; every position can appear first.
+/// This replaces the earlier power-of-two LCG, whose first state was always
+/// `1 mod 4` (even seed) or `2 mod 4` (odd seed), so positions `0` and `3 mod 4`
+/// could never be selected first (audit DS18). Determinism is independent of
+/// thread scheduling.
+fn random_scan_positions(win_size: usize, scan_seed: u64, count: usize) -> Vec<usize> {
+    let count = count.min(win_size);
+    // Mix the node seed once so a zero seed is not a degenerate SplitMix start.
+    let mut state = scan_seed ^ 0xD1B5_4A32_D192_ED03;
+    // Sparse view of the virtual array a[k] = value currently at slot k; a slot
+    // absent from the map still holds its identity value k.
+    let mut swapped: std::collections::HashMap<usize, usize> = HashMap::with_capacity(count);
+    let value_at = |swapped: &HashMap<usize, usize>, slot: usize| -> usize {
+        swapped.get(&slot).copied().unwrap_or(slot)
+    };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        // Draw slot j uniformly in [i, win_size); emit a[j], move a[i] into j.
+        let j = i + bounded_u64(&mut state, (win_size - i) as u64) as usize;
+        let drawn = value_at(&swapped, j);
+        let displaced = value_at(&swapped, i);
+        out.push(drawn);
+        // Only slot j is read again (future i' > i never revisit slots < i').
+        swapped.insert(j, displaced);
     }
     out
 }
@@ -1133,8 +1180,16 @@ pub fn scan_node(
     check_centers: bool,
 ) -> Option<Array1<i64>> {
     let dim = lo.len();
+    // Audit DS05: reject a degenerate or empty window before any `% win_size`
+    // (division by zero) or `dim - 1` (underflow) can abort the process.
+    if dim == 0 {
+        return None;
+    }
     let win_shape_u: Vec<usize> = win_shape.iter().map(|&size| size as usize).collect();
     let win_size: usize = win_shape_u.iter().product();
+    if win_size == 0 {
+        return None;
+    }
     let mut win_strides = vec![1_usize; dim];
     for axis in (0..dim - 1).rev() {
         win_strides[axis] = win_strides[axis + 1] * win_shape_u[axis + 1];
@@ -1142,7 +1197,21 @@ pub fn scan_node(
 
     let dsbc = threshold <= 0.0;
     let active_weight_total: f64 = variable_weights.sum();
-    let penalty_all = penalty_flat.as_slice().expect("penalty_flat is contiguous");
+    // Copy to an owned buffer so a non-contiguous (strided) penalty array does
+    // not abort via `.as_slice().expect(...)` (audit DS05); the matrix is tiny.
+    let penalty_owned = penalty_flat.to_vec();
+    let penalty_all = penalty_owned.as_slice();
+    // Every active penalty variable's CxC block must fit the supplied buffer.
+    for variable in 0..active_ti_rows.len() {
+        if metric_kinds[variable] == METRIC_CATEGORICAL_PENALTY {
+            let ncat = penalty_ncat[variable] as usize;
+            let needed =
+                (penalty_offsets[variable] as usize).saturating_add(ncat.saturating_mul(ncat));
+            if needed > penalty_all.len() {
+                return None;
+            }
+        }
+    }
     let mut best_distance = f64::INFINITY;
     let mut best_coords: Option<Vec<i64>> = None;
 
@@ -1186,6 +1255,12 @@ pub fn scan_node(
 
         let mut distance = 0.0_f64;
         for variable in 0..active_ti_rows.len() {
+            // Skip zero-weight variables before evaluating the metric (audit
+            // DS03): an all-undefined masked event returns +inf, and 0 * inf is
+            // NaN, which would poison the best-candidate/threshold comparison.
+            if variable_weights[variable] == 0.0 {
+                continue;
+            }
             let event_start = event_offsets[variable] as usize;
             let event_end = event_offsets[variable + 1] as usize;
             let de_var = de_sim.slice(s![event_start..event_end]);
@@ -1568,6 +1643,18 @@ mod tests {
             random_scan_positions(64, 42, 8),
             random_scan_positions(64, 43, 8)
         );
+    }
+
+    #[test]
+    fn random_scan_first_position_is_unbiased() {
+        // DS18 regression: a 4-cell window with a budget of 1 must be able to
+        // pick every position first. The old power-of-two LCG produced only
+        // 1 or 2 mod 4 first, never 0 or 3.
+        use std::collections::HashSet;
+        let firsts: HashSet<usize> = (0..64u64)
+            .map(|seed| random_scan_positions(4, seed, 1)[0])
+            .collect();
+        assert_eq!(firsts, HashSet::from([0, 1, 2, 3]));
     }
 
     #[test]
