@@ -11,7 +11,12 @@ documentation = "https://docs.rs/gstools-core"
 license = "LGPL-3.0-or-later"
 categories = ["science", "mathematics"]
 keywords = ["geostatistics", "srf", "kriging", "variogram", "python"]
-exclude = ["dist/", ".*"]
+# Keep source archives buildable without local studies, caches, or private notes.
+include = [
+    "src/**", "benches/*.rs", "benches/*.py", "scripts/*.py",
+    "scripts/README.md", "Cargo.toml", "Cargo.lock", "pyproject.toml",
+    "README.md", "CONTRIBUTING.md", "AUTHORS.md", "LICENSE", "katex-header.html",
+]
 
 [lib]
 name = "gstools_core"

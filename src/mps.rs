@@ -341,9 +341,8 @@ pub fn dist_block_categorical(
 /// sequential, preserving the scalar summation order and thread-count-
 /// independent results.
 ///
-/// This function uses the currently installed Rayon pool. The Action Plan 4
-/// harness runs each requested thread count in a fresh process with
-/// `RAYON_NUM_THREADS` set before the first Rayon call.
+/// This function uses the currently installed Rayon pool. Set
+/// `RAYON_NUM_THREADS` before the first Rayon call to configure that pool.
 ///
 /// # Arguments
 ///
@@ -1010,7 +1009,7 @@ pub fn scan_node_categorical(
     node_weights: ArrayView1<'_, f64>,
 ) -> Option<Array1<i64>> {
     let dim = lo.len();
-    // Audit DS05: a degenerate or empty window would abort on `% win_size` or
+    // A degenerate or empty window would abort on `% win_size` or
     // `dim - 1`; return "no match" instead.
     if dim == 0 {
         return None;
@@ -1112,7 +1111,7 @@ fn bounded_u64(state: &mut u64, bound: u64) -> u64 {
 /// is an unbiased sample without replacement; every position can appear first.
 /// This replaces the earlier power-of-two LCG, whose first state was always
 /// `1 mod 4` (even seed) or `2 mod 4` (odd seed), so positions `0` and `3 mod 4`
-/// could never be selected first (audit DS18). Determinism is independent of
+/// could never be selected first. Determinism is independent of
 /// thread scheduling.
 fn random_scan_positions(win_size: usize, scan_seed: u64, count: usize) -> Vec<usize> {
     let count = count.min(win_size);
@@ -1411,7 +1410,7 @@ pub fn scan_node(
     check_centers: bool,
 ) -> Option<Array1<i64>> {
     let dim = lo.len();
-    // Audit DS05: reject a degenerate or empty window before any `% win_size`
+    // Reject a degenerate or empty window before any `% win_size`
     // (division by zero) or `dim - 1` (underflow) can abort the process.
     if dim == 0 {
         return None;
@@ -1429,7 +1428,7 @@ pub fn scan_node(
     let dsbc = threshold <= 0.0;
     let active_weight_total: f64 = variable_weights.sum();
     // Copy to an owned buffer so a non-contiguous (strided) penalty array does
-    // not abort via `.as_slice().expect(...)` (audit DS05); the matrix is tiny.
+    // not abort via `.as_slice().expect(...)`; the matrix is tiny.
     let penalty_owned = penalty_flat.to_vec();
     let penalty_all = penalty_owned.as_slice();
     // Every active penalty variable's CxC block must fit the supplied buffer.
@@ -1488,8 +1487,8 @@ pub fn scan_node(
 
         let mut distance = 0.0_f64;
         for variable in 0..active_ti_rows.len() {
-            // Skip zero-weight variables before evaluating the metric (audit
-            // DS03): an all-undefined masked event returns +inf, and 0 * inf is
+            // Skip zero-weight variables before evaluating the metric: an
+            // all-undefined masked event returns +inf, and 0 * inf is
             // NaN, which would poison the best-candidate/threshold comparison.
             if variable_weights[variable] == 0.0 {
                 continue;
@@ -1982,7 +1981,7 @@ mod tests {
 
     #[test]
     fn random_scan_first_position_is_unbiased() {
-        // DS18 regression: a 4-cell window with a budget of 1 must be able to
+        // A 4-cell window with a budget of 1 must be able to
         // pick every position first. The old power-of-two LCG produced only
         // 1 or 2 mod 4 first, never 0 or 3.
         use std::collections::HashSet;

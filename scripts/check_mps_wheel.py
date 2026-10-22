@@ -1,8 +1,7 @@
 """Smoke-test the MPS exports of an installed gstools-core wheel.
 
 Calls the current ABI-7 ``mps_simulate`` / ``mps_cleanup_pass`` signatures with
-explicit keyword arguments so a future positional change fails loudly here
-(audit DS19). Requires the versioned API export and the cleanup entry point in
+explicit keyword arguments so a future positional change fails loudly here. Requires the versioned API export and the cleanup entry point in
 addition to the distance/scan/simulate kernels.
 """
 
@@ -98,7 +97,13 @@ def main() -> None:
         gstools_core.mps_simulate(**_engine_kwargs())
     )
     np.testing.assert_array_equal(field, np.array([[0.0]]))
-    assert (strict_fallbacks, levels, ready_width, threads, collapsed) == (0, 1, 1, 1, 0)
+    assert (strict_fallbacks, levels, ready_width, threads, collapsed) == (
+        0,
+        1,
+        1,
+        1,
+        0,
+    )
 
     # Cleanup smoke check: a complete one-cell field is re-simulated in place.
     cleanup_kwargs = {
@@ -117,4 +122,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    argparse.ArgumentParser(description=__doc__).parse_args()
     main()

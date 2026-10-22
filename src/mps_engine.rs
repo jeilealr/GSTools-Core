@@ -327,14 +327,14 @@ fn compute_node_weights(
     }
     let total: f64 = weights.iter().sum();
     if total.is_finite() && total > 0.0 {
-        // Ordinary path — bit-identical to the historical behaviour.
+        // Direct normalization preserves the ordinary-case arithmetic order.
         for weight in &mut weights {
             *weight /= total;
         }
         return weights;
     }
 
-    // Degenerate direct sum (finding F1): raw weights overflowed to +inf (large
+    // Degenerate direct sum: raw weights overflowed to +inf (large
     // finite cond_weight) or every positive weight underflowed to 0 (large
     // distance_power). Rebuild in the log domain so neither extreme collapses
     // to a uniform or all-zero event. A node is a structural zero only by
@@ -623,8 +623,8 @@ fn simulate_node(
     let mut events = Vec::with_capacity(fields.nrows());
     let mut collapsed_lag_count = 0_usize;
     for variable in 0..fields.nrows() {
-        // Zero-weight variables are excluded from the search BEFORE geometry
-        // (audit DS03): an empty event places no constraint on the TI-window
+        // Zero-weight variables are excluded before search geometry.
+        // An empty event places no constraint on the TI-window
         // intersection and is never scored, so an ignored variable cannot
         // discard a valid positive-weight match. Its centre is still pasted
         // from the chosen anchor (targets are independent of weight).
@@ -843,12 +843,11 @@ fn simulate_node(
             if metric_kinds[variable] != 2 || events[variable].len() == 0 {
                 return (variable, center);
             }
-            // Common-support mean shift (audit DS04): average SG - TI over only
+            // Common-support mean shift: average SG - TI over only
             // the lags where BOTH the SG event value and the anchored TI value
             // are finite — the exact support the variation score used. The
-            // earlier code averaged the SG and TI events over different
-            // supports (nanmean of each independently), which shifted the paste
-            // by a value the score never saw.
+            // means computed independently would shift the paste using values
+            // outside the event support used for scoring.
             let event = &events[variable];
             let mut shift_sum = 0.0_f64;
             let mut common = 0_usize;
@@ -1036,8 +1035,8 @@ fn validate_engine_configuration(
 
 /// Validate the *contents* (not just the shapes) that the engines will index
 /// or that must be finite, returning a controlled error instead of letting a
-/// later out-of-bounds index or `0 * inf` abort the release process (audit
-/// DS05). NaN is the legitimate missing-value marker and is allowed; only
+/// later out-of-bounds access can panic. NaN is the legitimate missing-value
+/// marker and is allowed; only
 /// infinities are rejected in the TI data.
 fn validate_engine_inputs(
     path: ArrayView2<'_, i64>,
@@ -1133,7 +1132,7 @@ fn build_domains<'a>(
     }
     let mut domain_finite_all: Vec<Vec<usize>> = Vec::with_capacity(n_zones + 1);
     let mut domain_ti_has_nan: Vec<bool> = Vec::with_capacity(n_zones + 1);
-    // Per-domain, per-variable missingness (audit DS17): the masked/unmasked
+    // Per-domain, per-variable missingness: the masked/unmasked
     // kernel choice must follow the SELECTED domain's data, not the primary's.
     // All flags are recomputed from the selected TI, including the primary,
     // so raw callers cannot accidentally select an unmasked kernel for NaN data.
@@ -1166,7 +1165,8 @@ fn build_domains<'a>(
 /// Run one complete MPS simulation with a deterministic scheduler.
 ///
 /// Python supplies the simulation path and per-node random values so seeded
-/// behavior remains stable during migration. Rust owns all per-node work. The
+/// behavior follows the frontend random-stream contract. Rust owns all
+/// per-node work. The
 /// path-derived neighbour graph is converted to fixed dependency levels;
 /// nodes inside one level are independent, calculated in parallel, and then
 /// committed in path order. Candidate/lag reductions remain sequential.
@@ -1343,8 +1343,7 @@ pub fn simulate_engine(
     }
     let max_ready_width = levels.iter().map(Vec::len).max().unwrap_or(0);
     // Building/waking a pool regressed the measured 256-node small case. Keep
-    // paths below 512 nodes serial; larger representative 2-D/3-D paths passed
-    // the Action Plan 7 continuation gate.
+    // paths below 512 nodes serial to avoid pool setup overhead.
     let used_threads = if num_threads > 1 && path.nrows() >= 512 {
         num_threads
     } else {
