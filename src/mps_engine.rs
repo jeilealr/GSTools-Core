@@ -326,15 +326,69 @@ fn compute_node_weights(
         }
     }
     let total: f64 = weights.iter().sum();
-    if total == 0.0 {
-        weights.fill(0.0);
-    } else if !total.is_finite() {
-        let uniform = 1.0 / weights.len() as f64;
-        weights.fill(uniform);
-    } else {
+    if total.is_finite() && total > 0.0 {
+        // Ordinary path — bit-identical to the historical behaviour.
         for weight in &mut weights {
             *weight /= total;
         }
+        return weights;
+    }
+
+    // Degenerate direct sum (finding F1): raw weights overflowed to +inf (large
+    // finite cond_weight) or every positive weight underflowed to 0 (large
+    // distance_power). Rebuild in the log domain so neither extreme collapses
+    // to a uniform or all-zero event. A node is a structural zero only by
+    // intent: a conditioning node with cond_weight == 0.
+    let count = weights.len();
+    let structural_zero = |index: usize| cond_weight == 0.0 && conditioned[index];
+    if (0..count).all(structural_zero) {
+        weights.fill(0.0);
+        return weights;
+    }
+    // log weight_i = -power * (log r_i - min log r) + log(cond_weight?), with
+    // r_i = 1 for a zero-lag baseline; then subtract the max before exp.
+    let log_lag: Vec<f64> = lag_norms
+        .iter()
+        .map(|&norm| {
+            if distance_power != 0.0 && norm != 0.0 {
+                norm.ln()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let min_log_lag = (0..count)
+        .filter(|&i| !structural_zero(i))
+        .map(|i| log_lag[i])
+        .fold(f64::INFINITY, f64::min);
+    let log_cond = if cond_weight > 0.0 {
+        cond_weight.ln()
+    } else {
+        0.0
+    };
+    let mut log_w: Vec<f64> = (0..count)
+        .map(|i| {
+            if structural_zero(i) {
+                f64::NEG_INFINITY
+            } else {
+                let mut value = -distance_power * (log_lag[i] - min_log_lag);
+                if conditioned[i] {
+                    value += log_cond;
+                }
+                value
+            }
+        })
+        .collect();
+    let max_log_w = log_w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for value in &mut log_w {
+        *value -= max_log_w;
+    }
+    for (weight, &value) in weights.iter_mut().zip(log_w.iter()) {
+        *weight = if value.is_finite() { value.exp() } else { 0.0 };
+    }
+    let total: f64 = weights.iter().sum();
+    for weight in &mut weights {
+        *weight /= total;
     }
     weights
 }
@@ -1752,6 +1806,26 @@ mod tests {
         let a = cleanup_fixture(array![0.25, 0.5], 1).0;
         let b = cleanup_fixture(array![0.25, 0.5], 1).0;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_node_weights_handles_overflow_and_underflow() {
+        // F1: a large finite cond_weight overflows the raw sum; the two hard
+        // nodes must still normalize to 0.5 each, not a uniform third.
+        let over = compute_node_weights(&[1.0, 1.0, 1.0], &[true, true, false], 0.0, 1e308);
+        assert!((over[0] - 0.5).abs() < 1e-9);
+        assert!((over[1] - 0.5).abs() < 1e-9);
+        assert!(over[2] > 0.0 && over[2] < 1e-300);
+        // A large distance_power underflows the far node to 0; the near node
+        // must keep weight 1, not collapse the whole event to zero.
+        let under = compute_node_weights(&[2.0, 3.0], &[false, false], 2048.0, 1.0);
+        assert_eq!(under, vec![1.0, 0.0]);
+        // Ordinary inputs stay on the direct path and sum to one.
+        let ordinary = compute_node_weights(&[1.0, 2.0], &[false, false], 1.0, 1.0);
+        assert!((ordinary.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        // Intentional all-conditioning zero-weight event stays all-zero.
+        let zeroed = compute_node_weights(&[0.0, 1.0], &[true, true], 0.0, 0.0);
+        assert_eq!(zeroed, vec![0.0, 0.0]);
     }
 
     #[test]
