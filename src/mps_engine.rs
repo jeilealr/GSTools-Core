@@ -1172,7 +1172,8 @@ fn build_domains<'a>(
 /// committed in path order. Candidate/lag reductions remain sequential.
 ///
 /// `max_radius` uses `NaN` to represent Python's `None`. `metric_kinds` uses
-/// `0` for categorical, `1` for continuous Lp, and `2` for variation.
+/// `0` for categorical, `1` for continuous Lp, `2` for variation, and `3` for
+/// categorical with a per-variable penalty matrix.
 /// `partial_boundary == false` means strict mode with the established partial
 /// fallback when the complete event cannot fit.
 ///

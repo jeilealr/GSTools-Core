@@ -333,7 +333,8 @@ pub fn dist_block_categorical(
     )
 }
 
-/// Experimental Rayon version of [`dist_block_categorical`].
+/// Parallel (Rayon) variant of [`dist_block_categorical`] for standalone
+/// benchmarking; not used by the production DS engine.
 ///
 /// Candidate rows are independent and are evaluated in parallel. Rayon uses
 /// an indexed iterator, so the returned array preserves the input candidate
@@ -413,11 +414,10 @@ pub fn dist_block_categorical_masked(
     }))
 }
 
-/// Experimental masked categorical Rayon kernel used by Criterion only.
+/// Parallel (Rayon) masked categorical kernel for standalone benchmarking only.
 ///
 /// It preserves candidate order and keeps each candidate's masked lag
-/// reduction sequential. It is deliberately not wired into GSTools during the
-/// first NaN-free categorical experiment.
+/// reduction sequential. It is not wired into the production DS engine.
 ///
 /// # Arguments
 ///
@@ -972,9 +972,10 @@ pub fn dist_block_variation_masked(
 /// Combines the Python `_scan_window` outer loop with `_dist_block` into a single
 /// Rust function. Iterates over candidate anchors in scan order (random start,
 /// sequential wrap-around) and computes the weighted categorical distance for each.
-/// Returns the TI coordinates of the best match, or `None` if every candidate has
-/// distance `f64::INFINITY` (only reachable on a masked TI — not triggered when
-/// `ti_has_nan = False`, which is required to reach this function).
+/// Returns the TI coordinates of the best match, or `None` when no candidate is
+/// selectable: an empty or zero-sized window, a zero scan budget, or every
+/// visited candidate scoring `f64::INFINITY` (e.g. an all-undefined masked
+/// window).
 ///
 /// # Arguments
 ///
@@ -994,7 +995,8 @@ pub fn dist_block_variation_masked(
 /// # Returns
 ///
 /// `Some(coords)` where `coords` has shape `(dim,)` with the TI coordinates of the
-/// best-match anchor, or `None` if all candidates have `f64::INFINITY` distance.
+/// best-match anchor, or `None` for an empty/zero-sized window, a zero scan
+/// budget, or when every visited candidate has `f64::INFINITY` distance.
 #[allow(clippy::too_many_arguments)]
 pub fn scan_node_categorical(
     lo: ArrayView1<'_, i64>,
@@ -1109,10 +1111,7 @@ fn bounded_u64(state: &mut u64, bound: u64) -> u64 {
 /// first draw is uniform over the whole window and each subsequent draw is
 /// uniform over the remaining positions, the generated *prefix* of any length
 /// is an unbiased sample without replacement; every position can appear first.
-/// This replaces the earlier power-of-two LCG, whose first state was always
-/// `1 mod 4` (even seed) or `2 mod 4` (odd seed), so positions `0` and `3 mod 4`
-/// could never be selected first. Determinism is independent of
-/// thread scheduling.
+/// Determinism is independent of thread scheduling.
 fn random_scan_positions(win_size: usize, scan_seed: u64, count: usize) -> Vec<usize> {
     let count = count.min(win_size);
     // Mix the node seed once so a zero seed is not a degenerate SplitMix start.
@@ -1353,7 +1352,8 @@ fn variation_candidate_distance(
 /// Per-variable events are stored in concatenated one-dimensional arrays.
 /// `event_offsets[v]..event_offsets[v + 1]` selects variable `v` in
 /// `de_sim`, `lag_flat`, and `node_weights`. `metric_kinds` uses `0` for
-/// categorical, `1` for continuous Lp, and `2` for variation distance.
+/// categorical, `1` for continuous Lp, `2` for variation distance, and `3` for
+/// categorical with a per-variable penalty matrix.
 ///
 /// # Arguments
 ///
@@ -1370,10 +1370,17 @@ fn variation_candidate_distance(
 /// * `lag_flat` – Concatenated flat TI lag offsets.
 /// * `node_weights` – Concatenated normalized event-node weights.
 /// * `variable_weights` – Global variable weights for the active variables.
-/// * `metric_kinds` – Metric code per active variable (`0`, `1`, or `2`).
+/// * `metric_kinds` – Metric code per active variable (`0`, `1`, `2`, or `3`).
 /// * `has_nan` – Nonzero when the active TI variable uses masked semantics.
 /// * `d_max` – Continuous normalization range per active variable.
 /// * `p_norm` – Lp or variation exponent per active variable.
+/// * `random_scan` – When true, visit a bounded, distinct, node-local random
+///   candidate prefix instead of the sequential wrap-around order.
+/// * `scan_seed` – Node-local seed for the random-scan prefix.
+/// * `penalty_flat` – Concatenated row-major `C x C` penalty matrices for the
+///   penalty (`metric_kind == 3`) variables.
+/// * `penalty_offsets` – Start offset into `penalty_flat` per active variable.
+/// * `penalty_ncat` – Category count `C` per active variable (`0` when unused).
 /// * `target_ti_rows` – TI rows whose candidate-centre values will be copied.
 /// * `check_centers` – Whether target centres must all be finite.
 ///
